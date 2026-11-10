@@ -1,0 +1,20 @@
+# input data and everything the notebooks write (not distributed)
+resources/*
+!resources/README.md
+results/
+figures/
+output/
+external/
+
+# rendered notebooks and knitr files
+*.html
+*_files/
+*_cache/
+figure/
+
+# R and OS files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
