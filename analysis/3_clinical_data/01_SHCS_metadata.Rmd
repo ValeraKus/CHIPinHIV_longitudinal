@@ -1,0 +1,307 @@
+---
+title: "SHCS participant metadata: demographics, HIV and ART history"
+author: "Valeriia Timonina"
+date: "2025-12-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F)
+knitr::opts_knit$set(root.dir = here::here())
+
+library(ggplot2)
+library(tidyverse)
+library(dtwclust)
+rm(list=ls(all=T))
+```
+
+This notebook reads the SHCS database export and derives, for every participant with a CHIP trajectory: sex,
+ethnicity, smoking, injection drug use, the CD4 nadir, coinfections, the ART start and the durations of the drugs, the
+time diagnosed but untreated, the set-point viral load, the viral load before and on ART, the age and year at the first
+and last sequenced sample, the duration of diagnosed HIV infection at the first sample, and the time with detectable
+HIV RNA. It writes `resources/SHCS_Metadata_univ.txt`, which is used by Table 1 and Tables S7 and S8.
+
+# Load data
+
+```{r}
+# the participants with a CHIP trajectory and all their sequenced timepoints (02_SHCS_CHIP_trajectories.Rmd): the
+# trajectory table has one row per trajectory and timepoint, including the timepoints at which the variant was not
+# detected, so the first and the last sample of a person are the first and the last sequenced sample
+traj_calls <- read.table("resources/chip_calls_long_filtered.txt", sep="\t", header=T)
+trajectories <- traj_calls %>%
+  select(ID, traj_id) %>% distinct()
+sample_dates <- traj_calls %>% select(ID, LABDATE) %>% distinct()
+
+pat <- read.csv("resources/SHCS_database/2025-09/pat.csv") %>% filter(ID %in% trajectories$ID)
+pat <- pat %>% select(ID, BORN, SEX, ETHNICITY, IVD, RISK, CV_SMOKED, HIV_POSDATE, HIV_POSDOCDATE, REGDATE) %>%
+  mutate(SEX=ifelse(SEX==1,1,0),
+         ETHNICITY=ifelse(ETHNICITY==1,1,0),
+       HIV_POSDATE=ifelse(HIV_POSDATE==""|is.na(HIV_POSDATE), HIV_POSDOCDATE, HIV_POSDATE),
+       HIV_POSDATE=ifelse(HIV_POSDATE==""|is.na(HIV_POSDATE), REGDATE, HIV_POSDATE)) %>%
+  select(-HIV_POSDOCDATE, -REGDATE)
+
+summary(pat)
+```
+
+
+```{r}
+lab <- read.csv("resources/SHCS_database/2025-09/lab.csv") %>% filter(ID %in% trajectories$ID)
+
+cd4_nadir <- lab %>%
+  group_by(ID) %>%
+  summarise(CD4_nadir=min(CD4, na.rm = T)) %>%
+  mutate(CD4_nadir_less200=ifelse(CD4_nadir<200,1,0))
+
+cd4_nadir %>% summary
+
+
+coinf <- lab %>%
+  select(ID, TBC, TBI, AGHBS, ANTIHBS, ANTIHBC, AGHBE, ANTIHBE, ANTIHDV, HBVDNA_QUAL, SYPH_Q, VDRL_Q,CMV,TOXO,ANTIHCV,HCV_RNA_QUAL) %>%
+  group_by(ID) %>%
+  summarise_all(function(x) sum(x=="P", na.rm = T)) %>%
+  rowwise() %>%
+  mutate(TB=ifelse(sum(TBC, TBI)>0,1,0),
+         HBV=ifelse(sum(ANTIHBC)>0,1,0),
+         SYPH=ifelse(sum(SYPH_Q, VDRL_Q)>0,1,0),
+         CMV=ifelse(sum(CMV)>0,1,0),
+         TOXO=ifelse(sum(TOXO)>0,1,0),
+         HCV=ifelse(sum(ANTIHCV,HCV_RNA_QUAL)>0,1,0)) %>%
+  select(ID, TB, HBV, HCV, SYPH,CMV, TOXO)
+
+coinf %>%   summary()
+```
+
+```{r}
+med_drug <- read.csv("resources/SHCS_database/2025-09/med_drug.csv") %>% filter(ID %in% trajectories$ID)
+med_drug_code <- read.csv("resources/SHCS_database/2025-09/med_drug_code.csv")
+med_drug_art <- med_drug %>%
+  filter(INDICATION == "A")
+
+drugs <- med_drug_art %>%
+  mutate(STOPDATE=ifelse((as.Date(STOPDATE) - as.Date("2025-09-01")) >0, LABDATE, STOPDATE)) %>%
+  group_by(ID) %>%
+  mutate(STOPDATE=ifelse(STOPDATE=="", as.Date("2025-09-01"), STOPDATE)) %>%
+  mutate(min_STARTDATE=min(as.Date(STARTDATE)),
+         START_before_2000=ifelse(year(as.Date(min_STARTDATE))<=2000, 1,0),
+         STARTED_ART=ifelse((min_STARTDATE - as.Date("2025-09-01")) < -180, 1, 0)) %>%
+  select(ID, START_before_2000, STARTED_ART) %>% distinct()
+
+
+drugs %>% summary
+```
+
+
+```{r}
+drugs_dur <- med_drug_art %>%
+  mutate(STOPDATE=ifelse(STOPDATE=="", "2025-09-01", STOPDATE)) %>%
+  mutate(Duration_days=as.numeric(as.Date(STOPDATE)-as.Date(STARTDATE))) %>%
+  select(ID, DRUG, Duration_days) %>%
+  group_by(ID, DRUG) %>%
+  mutate(Duration_days=sum(Duration_days)) %>% 
+  distinct() %>%
+  pivot_wider(names_from = DRUG, values_from = Duration_days, id_cols = ID) %>%
+   replace(is.na(.), 0) %>%
+  mutate(across(
+    where(is.numeric),
+    ~ as.integer(.x > 0),
+    .names = "{.col}_bin"
+  ))
+
+
+drugs_cat_dur <- med_drug_art %>%
+  merge(med_drug_code, by.x="DRUG", by.y="DRUG_CODE") %>%
+  mutate(STOPDATE=ifelse(STOPDATE=="", "2025-09-01", STOPDATE)) %>%
+  mutate(Duration_days=as.numeric(as.Date(STOPDATE)-as.Date(STARTDATE))) %>%
+  select(ID, CATEGORY_ID, Duration_days) %>%
+  group_by(ID, CATEGORY_ID) %>%
+  mutate(Duration_days=sum(Duration_days)) %>% 
+  distinct() %>%
+  pivot_wider(names_from = CATEGORY_ID, values_from = Duration_days, id_cols = ID) %>%
+   replace(is.na(.), 0) %>%
+  mutate(across(
+    where(is.numeric),
+    ~ as.integer(.x > 0),
+    .names = "{.col}_bin"
+  ))
+```
+
+
+```{r}
+noART_dur <- med_drug_art %>%
+  mutate(STOPDATE=ifelse((as.Date(STOPDATE) - as.Date("2025-09-01")) >0, LABDATE, STOPDATE)) %>%
+  group_by(ID) %>%
+  mutate(STOPDATE=ifelse(STOPDATE=="", as.Date("2025-09-01"), STOPDATE)) %>%
+  mutate(min_STARTDATE=min(as.Date(STARTDATE))) %>%
+  select(ID, min_STARTDATE) %>% distinct() %>%
+  merge(pat %>% select(ID, HIV_POSDATE), by="ID") %>%
+  mutate(without_ART_days=as.numeric(as.Date(min_STARTDATE)-as.Date(HIV_POSDATE))) %>%
+  mutate(without_ART_days=ifelse(without_ART_days<0,0,without_ART_days)) %>%
+  select(ID, without_ART_days)
+
+hist(log10(noART_dur$without_ART_days+1))
+```
+
+
+
+```{r}
+spVL1 <- read.table("resources/spVL/spVL_calc.txt", header=F, sep="\t")
+colnames(spVL1) <- c("ID", "spVL1")
+
+sp_VL2 <- read.table("resources/spVL/spVL_all_patients.txt", header=F, sep=" ") %>% select(-V2)
+colnames(sp_VL2) <- c("ID", "spVL2")
+
+sp_VL <- merge(spVL1, sp_VL2, by="ID", all = T) %>%
+   mutate(spVL1=ifelse(is.na(spVL1), spVL2, spVL1),
+         spVL2=ifelse(is.na(spVL2), spVL1, spVL2)) %>%
+filter(!(is.na(spVL1))) %>%
+  rowwise() %>%
+  mutate(spVL=mean(c(spVL1, spVL2))) %>%
+  filter(ID %in% trajectories$ID) %>%
+  select(ID, spVL)
+```
+
+
+```{r}
+rna <- med_drug_art %>%
+  mutate(STOPDATE=ifelse((as.Date(STOPDATE) - as.Date("2025-09-01")) >0, LABDATE, STOPDATE)) %>%
+  group_by(ID) %>%
+  mutate(STOPDATE=ifelse(STOPDATE=="", as.Date("2025-09-01"), STOPDATE)) %>%
+  mutate(min_STARTDATE=min(as.Date(STARTDATE))) %>%
+  select(ID, min_STARTDATE) %>% distinct() %>%
+  merge(lab %>%
+          select(ID, LABDATE, RNA)) %>%
+  mutate(RNA_before_ART=ifelse(as.Date(LABDATE)-as.Date(min_STARTDATE) < 60, 1, 0))
+
+rna_before <- rna %>%
+  filter(RNA_before_ART == 1) %>%
+  filter(!is.na(RNA)) %>%
+  group_by(ID) %>%
+  summarise(mean_preART_RNA=mean(RNA, na.rm=T),
+            median_preART_RNA=median(RNA, na.rm=T),
+            max_preART_RNA=max(RNA, na.rm=T))
+
+rna_after <- rna %>%
+  filter(RNA_before_ART == 0) %>%
+  filter(!is.na(RNA)) %>%
+  group_by(ID) %>%
+  summarise(max_RNA_ART=max(RNA),
+            mean_RNA_ART=mean(RNA),
+            median_RNA_ART=median(RNA))
+
+
+```
+
+
+
+```{r}
+covar <- trajectories %>%
+  merge(pat, all=T) %>%
+  merge(cd4_nadir, all = T) %>%
+  merge(coinf, all=T) %>%
+  merge(drugs, all=T) %>%
+  merge(drugs_dur, all=T) %>%
+  merge(drugs_cat_dur, all=T) %>%
+  merge(noART_dur, all=T) %>%
+  merge(sp_VL, all=T) %>%
+  merge(rna_before, all = T) %>%
+  merge(rna_after, all = T)
+```
+
+
+```{r}
+
+age <- sample_dates %>%
+  merge(pat %>% select(ID, BORN)) %>%
+  mutate(Age=year(as.Date(LABDATE))-BORN) %>%
+  group_by(ID) %>%
+  summarise(min_Age=min(Age),
+            max_Age=max(Age),
+            first_Year=year(min(LABDATE)),
+            last_Year=year(max(LABDATE))) %>%
+  mutate(FollowUp_Time=max_Age-min_Age)
+
+
+
+rna_Mean <- sample_dates %>%
+  group_by(ID) %>%
+  summarise(min_LABDATE=min(as.Date(LABDATE)),
+            max_LABDATE=max(as.Date(LABDATE))) %>%
+  merge(rna %>%
+  rename(RNA_LABDATE=LABDATE)) %>%
+  filter(as.Date(RNA_LABDATE)>=min_LABDATE & as.Date(RNA_LABDATE)<=max_LABDATE) %>%
+  group_by(ID) %>%
+  summarise(mean_RNA_VL=mean(RNA, na.rm=T),
+            median_RNA_VL=median(RNA, na.rm=T))
+
+
+hiv_dur <- sample_dates %>%
+  group_by(ID) %>%
+  summarise(min_LABDATE=min(as.Date(LABDATE)),
+            max_LABDATE=max(as.Date(LABDATE))) %>%
+  merge(pat) %>%
+ mutate(HIV_dur=round(as.numeric(min_LABDATE-as.Date(HIV_POSDATE))/365.25, digits = 2)) %>%
+  select(ID, HIV_dur)
+  
+  
+
+```
+
+
+Time with detectable HIV RNA: the sum of the intervals between consecutive RNA measurements that end with a detectable
+measurement (RNA > 0), so that every interval is counted once.
+
+```{r}
+time_detect_rna <- rna %>%
+  filter(!is.na(RNA)) %>%
+  group_by(ID) %>%
+  arrange(ID, as.Date(LABDATE)) %>%
+  mutate(deltaTime=c(0, diff(as.Date(LABDATE)))) %>%
+  mutate(cumTime=ifelse(RNA>0, deltaTime, 0)) %>%
+  summarize(TimeDetectRNA=round(sum(cumTime, na.rm = T)/365.25,digits = 2))
+```
+
+
+
+
+```{r}
+covar <- covar %>%
+  select(-traj_id) %>%
+  distinct() %>%
+  merge(age, by="ID") %>%
+  merge(rna_Mean, by="ID") %>%
+  merge(time_detect_rna, by="ID") %>%
+  merge(hiv_dur, by="ID")
+```
+
+
+```{r}
+write.table(covar, "resources/SHCS_Metadata_univ.txt", quote = F, row.names = F, sep="\t")
+```
+
+# Epidemiological description
+
+```{r}
+covar <- read.table("resources/SHCS_Metadata_univ.txt", sep="\t", header = T)
+```
+
+
+
+```{r}
+apply(covar %>% select(min_Age, max_Age, FollowUp_Time, HIV_dur, median_RNA_VL, CD4_nadir), MARGIN = 2, median, na.rm=T)
+apply(covar %>% select(min_Age, max_Age, FollowUp_Time, HIV_dur, median_RNA_VL, CD4_nadir), MARGIN = 2, quantile, na.rm=T, probs=c(0.25, 0.75))
+apply(covar%>%select(ETHNICITY, SEX, IVD,RISK,CV_SMOKED,CD4_nadir_less200), MARGIN = 2, table)
+apply(covar%>%select(ETHNICITY, SEX, IVD,RISK,CV_SMOKED,CD4_nadir_less200), MARGIN = 2, mean, na.rm=T)
+```
+
+
+```{r}
+boxplot(covar$CD4_nadir)
+boxplot(log10(covar$mean_RNA_VL+1))
+boxplot(covar$HIV_dur)
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

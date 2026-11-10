@@ -1,0 +1,278 @@
+---
+title: "SardiNIA and SHCS: extrapolated curves and ages at the VAF thresholds"
+author: "Valeriia Timonina"
+date: "2026-11-03"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+params:
+  cross_sectional: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 9, fig.height = 5)
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+```
+
+```{r paths}
+# cross_sectional = TRUE: the SHCS trajectories with the cross-sectional calls, read from and written to their own folders
+lod_sub <- if (params$cross_sectional) "LoD/cross_sectional" else "LoD"
+resources_lod <- file.path("resources", lod_sub)
+results_lod   <- file.path("results", lod_sub)
+figures_lod   <- file.path("figures", lod_sub)
+for (d in c(resources_lod, results_lod, figures_lod)) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+shcs_calls_file <- if (params$cross_sectional) file.path(resources_lod, "chip_calls_long_filtered.txt") else "resources/chip_calls_long_filtered.txt"
+```
+
+`r if (params$cross_sectional) "**Sensitivity analysis: this run uses the SHCS trajectories that include the cross-sectional calls.** The paths named in the text are those of the main analysis; this run reads and writes the folders cross_sectional under them."`
+
+
+```{r}
+source("R/Set_colors.R")
+source("R/spline_functions.R")
+```
+
+The SHCS trajectories (`resources/chip_calls_long_filtered.txt`) and the SardiNIA trajectories
+(`resources/LoD/sardinia_chip_calls_long_filtered.txt`) get
+the main spline (`spec_main` = `r spec_main_name`), extrapolated back, and four ages on the rise of the extrapolated curve
+to CHIP (up to the first age at which it reaches 2%):
+
+| Age | Threshold |
+|---|---|
+| `Age_zero` | last age at which the curve is <= `r zero_vaf * 100`% |
+| `Age_LoD2` | last upward crossing of half the mean LoD of the trajectory |
+| `Age_LoD` | last upward crossing of the mean LoD of the trajectory |
+| `Age_0.02` | age at which the curve reaches 2% |
+
+An age is `NA` (left-censored) when the curve is above its threshold during the whole rise.
+
+`Age_LoD2` replaces 0% as the point at which a clone is taken to appear: below half the LoD of the trajectory nothing is known about
+its size. `Age_zero` is kept for comparison. Because the LoD depends on depth, the VAF at which
+`Age_LoD2` and `Age_LoD` are read differs between trajectories, and is higher in SardiNIA (section 1).
+
+**Curves extrapolated to LoD / 2.** A
+curve is extended back from its first measurement to the last age at which the spline is below half the LoD of the trajectory, in place of
+`r zero_vaf * 100`%, and floored at this value as in
+`01_spline_fits.Rmd`. A curve that is already below this value at the first measurement is not extended.
+
+The notebook writes, in `resources/LoD/`, for `Sardinia` and for `SHCS`: `<cohort>_trajectories_threshold_ages.txt`,
+`<cohort>_predicted_trajectories_derivatives2_zero_extrap.txt` and `<cohort>_predicted_trajectories_derivatives2_LoD2_extrap.txt`. The files of
+both cohorts come from one run of the same `spec_main` (section 2).
+
+
+# 1. Data
+
+```{r}
+sard_calls <- read.table(file.path(resources_lod, "sardinia_chip_calls_long_filtered.txt"), sep = "\t", header = TRUE) %>% as_tibble()
+shcs_calls <- read.table(shcs_calls_file, sep = "\t", header = TRUE) %>% as_tibble()
+
+lod_sard <- sard_calls %>% distinct(traj_id, lod = traj_lod_mean)
+lod_shcs <- shcs_calls %>% distinct(traj_id, lod = traj_lod_mean)
+stopifnot(!anyDuplicated(lod_sard$traj_id), !anyNA(lod_sard$lod), !anyDuplicated(lod_shcs$traj_id), !anyNA(lod_shcs$lod))
+
+bind_rows(lod_shcs %>% mutate(Cohort = "SHCS"), lod_sard %>% mutate(Cohort = "Sardinia")) %>%
+  group_by(Cohort) %>%
+  summarise(trajectories = n(),
+            `mean LoD of the trajectories, median (range) %` = sprintf("%.3f (%.3f-%.3f)", 100 * median(lod), 100 * min(lod), 100 * max(lod))) %>%
+  knitr::kable()
+```
+
+
+# 2. Ages
+
+```{r}
+extrap_cols <- c("Age", "ID", "traj_id", "VAF", "VAF_speed", "VAF_acceleration", "N_CHIP", "Gene.refGene", "data_point", "out_of_range",
+                 "Time", "VAF_acceleration_sign")
+
+predicted_trajectories2 <- predict_all(sard_calls, spec_main, extrapolate = TRUE) %>% select(all_of(extrap_cols))
+stopifnot(setequal(predicted_trajectories2$traj_id, sard_calls$traj_id))
+
+age_zero <- threshold_ages(predicted_trajectories2, lod_sard)
+stopifnot(nrow(age_zero) == n_distinct(sard_calls$traj_id),
+          with(age_zero, all(Age_zero <= Age_LoD2, Age_LoD2 <= Age_LoD, Age_LoD <= Age_0.02, na.rm = TRUE)))
+
+shcs_pred2 <- predict_all(shcs_calls, spec_main, extrapolate = TRUE) %>% select(all_of(extrap_cols))
+shcs_ages  <- threshold_ages(shcs_pred2, lod_shcs)
+stopifnot(setequal(shcs_pred2$traj_id, shcs_calls$traj_id),
+          with(shcs_ages, all(Age_zero <= Age_LoD2, Age_LoD2 <= Age_LoD, Age_LoD <= Age_0.02, na.rm = TRUE)))
+```
+
+The two cohorts use the same `spec_main`. The next chunk is a comparison of the SHCS ages with an earlier version of the
+analysis (`resources/SHCS_trajectories_threshold_ages.txt`, not part of this repository); it runs only if that file is present:
+
+```{r, eval = file.exists("resources/SHCS_trajectories_threshold_ages.txt")}
+# optional: against the ages of an earlier version of the analysis
+saved_ages <- read.table("resources/SHCS_trajectories_threshold_ages.txt", header = TRUE, sep = "\t", check.names = FALSE)
+
+shcs_ages %>%
+  pivot_longer(-traj_id, names_to = "age", values_to = "here") %>%
+  left_join(saved_ages %>% pivot_longer(-traj_id, names_to = "age", values_to = "file"), by = c("traj_id", "age")) %>%
+  mutate(age = factor(age, levels = c("Age_zero", "Age_LoD2", "Age_LoD", "Age_0.02"))) %>%
+  group_by(age) %>%
+  summarise(`both estimated` = sum(!is.na(here) & !is.na(file)), `only in this notebook` = sum(!is.na(here) & is.na(file)),
+            `only in the file` = sum(is.na(here) & !is.na(file)),
+            `difference (years), median (IQR)` = sprintf("%.2f (%.2f-%.2f)", median(here - file, na.rm = TRUE),
+                                                         quantile(here - file, .25, na.rm = TRUE), quantile(here - file, .75, na.rm = TRUE)),
+            `Spearman rho` = cor(here, file, method = "spearman", use = "complete.obs")) %>%
+  knitr::kable(digits = 3)
+```
+
+```{r}
+ages_long <- bind_rows(shcs_ages %>% mutate(Cohort = "SHCS"), age_zero %>% mutate(Cohort = "Sardinia")) %>%
+  pivot_longer(c(Age_zero, Age_LoD2, Age_LoD, Age_0.02), names_to = "age", values_to = "value") %>%
+  mutate(age = factor(age, levels = c("Age_zero", "Age_LoD2", "Age_LoD", "Age_0.02")))
+
+ages_long %>%
+  group_by(age, Cohort) %>%
+  summarise(estimated = sum(!is.na(value)), `left-censored (NA)` = sum(is.na(value)),
+            `median (IQR)` = sprintf("%.1f (%.1f-%.1f)", median(value, na.rm = T), quantile(value, .25, na.rm = T),
+                                     quantile(value, .75, na.rm = T)),
+            range = sprintf("%.1f-%.1f", min(value, na.rm = T), max(value, na.rm = T)), .groups = "drop") %>%
+  knitr::kable(caption = "Ages at the VAF thresholds")
+```
+
+Time between the ages (years), for the trajectories that have both:
+
+```{r}
+bind_rows(shcs_ages %>% mutate(Cohort = "SHCS"), age_zero %>% mutate(Cohort = "Sardinia")) %>%
+  transmute(Cohort, `origin -> LoD/2` = Age_LoD2 - Age_zero, `LoD/2 -> LoD` = Age_LoD - Age_LoD2, `LoD -> 2%` = Age_0.02 - Age_LoD,
+            `LoD/2 -> 2%` = Age_0.02 - Age_LoD2, `origin -> 2%` = Age_0.02 - Age_zero) %>%
+  pivot_longer(-Cohort, names_to = "interval", values_to = "years") %>%
+  mutate(interval = fct_inorder(interval)) %>%
+  group_by(interval, Cohort) %>%
+  summarise(trajectories = sum(!is.na(years)),
+            `median (IQR)` = sprintf("%.1f (%.1f-%.1f)", median(years, na.rm = T), quantile(years, .25, na.rm = T),
+                                     quantile(years, .75, na.rm = T)), .groups = "drop") %>%
+  knitr::kable()
+```
+
+```{r, fig.width=12, fig.height=7}
+predicted_trajectories2 %>%
+  mutate(Gene.refGene = group_genes(Gene.refGene)) %>%
+  ggplot(aes(x = Age, y = VAF, group = traj_id, color = Gene.refGene)) +
+  geom_line() +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+  scale_color_manual(values = gene_colors) +
+  facet_wrap(~Gene.refGene) +
+  ggtitle("SardiNIA, extrapolated to zero") +
+  theme_classic()
+```
+
+
+## 2.1 Ages by gene
+
+```{r, fig.width=13, fig.height=4.5}
+ages_gene <- age_zero %>%
+  left_join(predicted_trajectories2 %>% distinct(traj_id, Gene.refGene), by = "traj_id") %>%
+  mutate(Gene.refGene = as.character(group_genes(Gene.refGene)))
+
+age_by_gene <- function(df, age, ylab) {
+  bind_rows(df, df %>% mutate(Gene.refGene = "All genes")) %>%
+    mutate(Gene.refGene = factor(Gene.refGene, levels = c("All genes", gene_levels))) %>%
+    ggplot(aes(y = .data[[age]], x = Gene.refGene)) +
+    geom_boxplot(aes(fill = Gene.refGene)) +
+    scale_fill_manual(values = gene_colors) +
+    theme_classic() + xlab("") + ylab(ylab) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "None")
+}
+
+gridExtra::grid.arrange(age_by_gene(ages_gene, "Age_zero", "Age at 0.1%"), age_by_gene(ages_gene, "Age_LoD2", "Age at LoD/2"),
+                        age_by_gene(ages_gene, "Age_LoD", "Age at LoD"), age_by_gene(ages_gene, "Age_0.02", "Age at VAF 2%"), nrow = 1)
+```
+
+
+# 3. Curves extrapolated to LoD / 2
+
+`predict_trajectory()` of `spline_functions.R`, with the LoD / 2 of the trajectory in place of `zero_vaf`:
+
+```{r}
+predict_extrap_lod2 <- function(obs, lod, spec = spec_main) {
+  obs <- arrange(obs, Age)
+  f <- fit_traj(obs$Age, obs$AF, spec)
+  lod2 <- lod / 2
+  ages <- seq(min(obs$Age), max(obs$Age), by = step)
+  if (max(f$predict(min(ages)), 0) > lod2) {
+    ages0 <- seq(0, max(obs$Age), by = step)
+    below <- which(f$predict(ages0) < lod2)
+    below <- below[below < which(ages0 == min(obs$Age))]
+    if (length(below) > 0) ages <- ages0[max(below):length(ages0)]
+  }
+  spline_curves(f$predict, ages) %>%
+    mutate(ID = obs$ID[1], traj_id = obs$traj_id[1], N_CHIP = obs$N_CHIP[1], Gene.refGene = obs$Gene.refGene[1],
+           data_point = as.numeric(Age %in% obs$Age), out_of_range = as.numeric(!(Age %in% obs$Age)),
+           traj_lod = lod, VAF_spline = VAF, VAF = pmax(VAF_spline, lod2)) %>%
+    arrange(Age) %>%
+    mutate(Time = 0:(n() - 1), VAF_acceleration_sign = sign(VAF_acceleration))
+}
+
+predict_all_lod2 <- function(calls, lod_tbl) {
+  calls %>%
+    group_split(traj_id) %>%
+    map(~ predict_extrap_lod2(.x, lod_tbl$lod[match(.x$traj_id[1], lod_tbl$traj_id)])) %>%
+    bind_rows() %>%
+    select(all_of(c(extrap_cols, "VAF_spline", "traj_lod")))
+}
+
+sard_lod2 <- predict_all_lod2(sard_calls, lod_sard)
+shcs_lod2 <- predict_all_lod2(shcs_calls, lod_shcs)
+stopifnot(setequal(sard_lod2$traj_id, sard_calls$traj_id), setequal(shcs_lod2$traj_id, shcs_calls$traj_id))
+```
+
+How far the curves are extended, against the first measurement:
+
+```{r}
+extension <- function(pred, calls) {
+  pred %>%
+    group_by(traj_id) %>%
+    summarise(start = min(Age), traj_lod = first(traj_lod), start_VAF = VAF_spline[which.min(Age)], .groups = "drop") %>%
+    left_join(calls %>% group_by(traj_id) %>% summarise(first_age = min(Age), .groups = "drop"), by = "traj_id") %>%
+    mutate(years_before = first_age - start, reaches = start_VAF < traj_lod / 2 | start < first_age)
+}
+
+ext_all <- bind_rows(extension(shcs_lod2, shcs_calls) %>% mutate(Cohort = "SHCS"),
+                     extension(sard_lod2, sard_calls) %>% mutate(Cohort = "Sardinia"))
+
+ext_all %>%
+  group_by(Cohort) %>%
+  summarise(trajectories = n(), `extended` = sum(years_before > 0),
+            `not extended: at or below LoD / 2 at the first measurement` = sum(years_before == 0 & start_VAF <= traj_lod / 2),
+            `not extended: never below LoD / 2 before the first measurement` = sum(years_before == 0 & start_VAF > traj_lod / 2),
+            `years before the first measurement, median (IQR) of the extended` =
+              sprintf("%.1f (%.1f-%.1f)", median(years_before[years_before > 0]), quantile(years_before[years_before > 0], .25),
+                      quantile(years_before[years_before > 0], .75)),
+            `extended beyond 30 years` = sum(years_before > 30)) %>%
+  knitr::kable()
+```
+
+```{r, fig.width=12, fig.height=7}
+bind_rows(shcs_lod2 %>% mutate(ID = as.character(ID), Cohort = "SHCS"), sard_lod2 %>% mutate(Cohort = "Sardinia")) %>%
+  mutate(Gene.refGene = group_genes(Gene.refGene)) %>%
+  ggplot(aes(x = Age, y = VAF, group = traj_id, color = Cohort)) +
+  geom_line(alpha = 0.6) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+  scale_color_manual(values = hiv_colors) +
+  facet_wrap(~Gene.refGene) +
+  ggtitle("Curves extrapolated to LoD / 2") +
+  theme_classic()
+```
+
+
+# 4. Save
+
+```{r}
+write.table(predicted_trajectories2, file.path(resources_lod, "Sardinia_predicted_trajectories_derivatives2_zero_extrap.txt"), sep = "\t", quote = F, row.names = F)
+write.table(age_zero, file.path(resources_lod, "Sardinia_trajectories_threshold_ages.txt"), sep = "\t", quote = F, row.names = F)
+write.table(shcs_pred2, file.path(resources_lod, "SHCS_predicted_trajectories_derivatives2_zero_extrap.txt"), sep = "\t", quote = F, row.names = F)
+write.table(shcs_ages, file.path(resources_lod, "SHCS_trajectories_threshold_ages.txt"), sep = "\t", quote = F, row.names = F)
+write.table(sard_lod2, file.path(resources_lod, "Sardinia_predicted_trajectories_derivatives2_LoD2_extrap.txt"), sep = "\t", quote = F, row.names = F)
+write.table(shcs_lod2, file.path(resources_lod, "SHCS_predicted_trajectories_derivatives2_LoD2_extrap.txt"), sep = "\t", quote = F, row.names = F)
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

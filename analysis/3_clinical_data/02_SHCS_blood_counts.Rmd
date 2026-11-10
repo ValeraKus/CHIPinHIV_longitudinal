@@ -1,0 +1,138 @@
+---
+title: "SHCS blood counts on the half-year grid of the CHIP trajectories"
+author: "Valeriia Timonina"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+library(lubridate)
+```
+
+The blood counts of the SHCS database are interpolated for each person and parameter with a smoothing spline
+(`smooth.spline()`, `spar` = 0.5) and predicted every half year. They are joined to the half-year grid of the REML curves
+of the CHIP trajectories and to the age at the start of antiretroviral therapy (first ART drug in `med_drug.csv`). The
+table `resources/SHCS_CHIP_blood_trajectories_merged.txt` is the input of the blood-parameter models
+(`6_figures_and_tables/Figure3_FiguresS9_S10.Rmd`, Figure 3, Figures S9 and S10, Table S9).
+
+```{r parameters}
+# half-year grid of the REML curves (2_trajectory_models/01_spline_fits.Rmd)
+curves_file <- "resources/LoD/SHCS_predicted_trajectories_derivatives.txt"
+db_dir <- "resources/SHCS_database/2025-09/"
+counts_cols <- c("LEU", "HEM", "PLA", "LYM", "CD3", "CD3P", "CD4", "CD4P", "CD8", "CD8P", "CD4_CD8_ratio", "RNA")
+```
+
+# Data
+
+```{r data}
+predicted_trajectories <- read.table(curves_file, sep = "\t", header = TRUE)
+
+lab <- read.csv(file.path(db_dir, "lab.csv")) %>%
+  filter(ID %in% predicted_trajectories$ID) %>%
+  select(ID, LABDATE, LEU, HEM, PLA, LYM, LYMP, CD3, CD3P, CD4, CD4P, CD8, CD8P, RNA, CENTER)
+
+pat <- read.csv(file.path(db_dir, "pat.csv")) %>%
+  filter(ID %in% predicted_trajectories$ID)
+
+lab <- lab %>%
+  merge(pat %>% select(ID, BORN), by = "ID") %>%
+  mutate(Age = as.numeric(as.Date(LABDATE) - as.Date(paste0(BORN, "-01-01"))) / 365.25) %>%
+  select(-BORN) %>%
+  mutate(CD4_CD8_ratio = (CD4 + 1) / (CD8 + 1))
+
+summary(lab %>% select(-ID, -LABDATE, -CENTER))
+```
+
+# Interpolation of the blood counts
+
+A parameter needs more than three measurements in a person; the prediction runs from the first to the last
+measurement (ages rounded to whole years) in steps of half a year, and negative predictions are set to 0.
+
+```{r interpolate}
+ids <- unique(lab$ID)
+predicted_lab <- c()
+
+for (i in seq_along(ids)) {
+  one_id <- ids[i]
+  one_id_pred_traj <- c()
+
+  for (col in counts_cols) {
+    one_traj <- lab %>% filter(ID == one_id) %>%
+      select(ID, LABDATE, Age, all_of(col)) %>%
+      mutate(data_point = 1) %>% arrange(Age) %>%
+      filter(!is.na(.data[[col]]))
+
+    if (nrow(one_traj) > 3) {
+      new_age <- seq(round(min(one_traj$Age)), round(max(one_traj$Age)), 0.5)
+      af_spl <- smooth.spline(x = one_traj$Age, y = one_traj[[col]], spar = 0.5)
+      y <- predict(af_spl, x = new_age)$y
+      y[y < 0] <- 0
+      df_pred_one_traj <- data.frame(ID = one_id, Age = new_age)
+      df_pred_one_traj[[col]] <- y
+    } else {
+      df_pred_one_traj <- data.frame(ID = one_id, Age = NA_real_)
+      df_pred_one_traj[[col]] <- NA_real_
+    }
+
+    # one row per person and age: the parameters are joined by age only
+    if (is.null(one_id_pred_traj)) {
+      one_id_pred_traj <- df_pred_one_traj
+    } else {
+      one_id_pred_traj <- merge(one_id_pred_traj, df_pred_one_traj, by = c("ID", "Age"), all = TRUE)
+    }
+  }
+  predicted_lab <- rbind(predicted_lab, one_id_pred_traj %>% filter(!is.na(Age)))
+}
+stopifnot(!anyDuplicated(predicted_lab[c("ID", "Age")]))
+
+tibble(parameter = counts_cols,
+       `persons with an interpolated curve` = map_int(counts_cols, ~ n_distinct(predicted_lab$ID[!is.na(predicted_lab[[.x]])]))) %>%
+  knitr::kable()
+```
+
+# Start of antiretroviral therapy
+
+```{r art-start}
+med_drug <- read.csv(file.path(db_dir, "med_drug.csv"))
+
+art_start <- med_drug %>%
+  filter(INDICATION == "A") %>%
+  filter(ID %in% predicted_trajectories$ID) %>%
+  group_by(ID) %>%
+  slice(which.min(as.Date(STARTDATE))) %>%
+  dplyr::select(ID, STARTDATE) %>%
+  merge(pat %>% select(ID, BORN), by = "ID") %>%
+  mutate(AgeArtStart = as.numeric(as.Date(STARTDATE) - as.Date(paste0(BORN, "-01-01"))) / 365.25) %>%
+  select(-BORN)
+
+rm(med_drug)
+```
+
+# Merge with the curves
+
+Each age of a curve gets the interpolated blood counts at the same age of the person (the curves and the blood counts
+are both on a half-year grid of whole and half years of age); the ages of a curve at which the person has no
+interpolated blood count are left out.
+
+```{r merge}
+traj <- predicted_trajectories %>%
+  inner_join(predicted_lab, by = c("ID", "Age")) %>%
+  inner_join(art_start, by = "ID") %>%
+  mutate(TimeSinceArtStart = round(Age - AgeArtStart, digits = 2))
+stopifnot(!anyDuplicated(traj[c("traj_id", "Age")]))
+
+cat(n_distinct(traj$ID), "persons,", n_distinct(traj$traj_id), "trajectories,", nrow(traj), "rows\n")
+
+write.table(traj, "resources/SHCS_CHIP_blood_trajectories_merged.txt", sep = "\t", quote = F, row.names = F)
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,583 @@
+---
+title: "Robustness of the REML spline: settings, read-count bootstrap, imputation of not detected timepoints, and a simulation study"
+author: "Valeriia Timonina"
+date: "2026-11-05"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+params:
+  quick: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 5)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+Robustness of the trajectory model of the paper, the penalised
+regression spline with REML smoothness selection (`spec_main` of `spline_functions.R`: `mgcv::gam(VAF ~ s(Age, k = 10),
+method = "REML")`, k at most the number of timepoints), with the figures and tables of the supplement
+(Figures S3-S5, Tables S2-S4):
+
+1. nine `smooth.spline()` settings against REML (hold-out error, per-trajectory statistics,
+   gene order, Fabre correlation, clusters);
+2. a read-count bootstrap (95% intervals of the per-trajectory statistics);
+3. the value given to the not detected timepoints (0, LoD/4, LoD/2, LoD, removed);
+4. the cross-sectional screening calls added to the trajectories;
+5. a simulation of clones with known fitness, sampled every 1 to 5 years and re-fitted with the REML spline and with the
+   `smooth.spline()` `spar` = 0.2 spline;
+6. one overview table of all sensitivity analyses.
+
+Figures go to `figures/paper/` and to `output/Supplementary_Figures/`, tables to
+`results/paper/`. Participant ids are the new ids of the paper (`SHCS_n`).
+
+```{r libraries}
+source("R/paper_functions.R")
+library(dtwclust)
+quick <- isTRUE(params$quick)   # a reduced run to test the code
+n_seeds_cl <- if (quick) 2 else 30      # seeds of the consensus DTW clustering (the main clusters of the paper use 100)
+B_boot <- if (quick) 5 else 200         # read-count bootstrap replicates
+n_cores <- max(1, min(6, parallel::detectCores() - 1))
+if (quick) {   # a test run writes nothing into results/, figures/ or output/
+  scratch <- file.path(tempdir(), "sensitivity_quick")
+  dir.create(scratch, showWarnings = FALSE)
+  paper$supp <- scratch; rev$figures <- scratch; rev$results <- scratch
+}
+reml_col <- "#B2182B"
+spar02_col <- "#2a78d6"
+```
+
+# 1. Data and the main analysis
+
+```{r data}
+calls <- load_calls()
+ids <- load_ids()
+lod_tbl <- calls %>% distinct(traj_id, lod = traj_lod_mean)
+fabre <- load_fabre()
+main_sum_saved <- load_sum()
+main_clusters <- load_final_clusters() %>% select(traj_id, cluster)   # the final consensus clusters (k = n_distinct(cluster))
+k_cl <- n_distinct(main_clusters$cluster)
+traj_ids <- sort(unique(calls$traj_id))
+label_tbl <- calls %>% distinct(traj_id, SHCS_ID_new, Gene.refGene, label) %>%
+  mutate(panel = paste(SHCS_ID_new, label), gene = group_genes(Gene.refGene))
+
+# the main analysis recomputed here: the same curves and statistics as resources/LoD/
+main <- run_pipeline(calls, spec_main, lod_tbl)
+chk <- inner_join(main$sum, main_sum_saved, by = "traj_id", suffix = c("", ".saved"))
+stopifnot(nrow(chk) == length(traj_ids), isTRUE(all.equal(chk$mean_VAF_speed, chk$mean_VAF_speed.saved)),
+          isTRUE(all.equal(chk$Age_0.02, chk$Age_0.02.saved)))
+
+# clusters: the consensus over n_seeds_cl seeds of the REML curves, labels matched to the saved consensus (100 seeds)
+cons_main <- cluster_consensus(main$pred, seeds = 1:n_seeds_cl, k = k_cl, ref = main_clusters)
+j <- inner_join(cons_main$clusters, main_clusters, by = "traj_id", suffix = c("", ".saved"))
+cat(sprintf("Main analysis: %d trajectories; consensus of %d seeds against the saved consensus of 100 seeds: ARI = %.3f\n",
+            length(traj_ids), n_seeds_cl, adjusted_rand(j$cluster, j$cluster.saved)))
+main$clusters <- main_clusters
+main <- modifyList(main, setting_results(main, fabre))
+cat("Gene order:", main$gene_order, "; Fabre r =", round(main$fabre$r, 3), ", p =", signif(main$fabre$p, 2), "\n")
+
+# everything one setting produces (no SardiNIA refit here); the clusters are matched to the main clusters
+run_setting <- function(spec, calls_in = calls, lod = lod_tbl) {
+  res <- run_pipeline(calls_in, spec, lod)
+  cl <- cluster_consensus(res$pred, seeds = 1:n_seeds_cl, k = k_cl, ref = main_clusters)
+  res$clusters <- cl$clusters %>% select(traj_id, cluster)
+  modifyList(res, setting_results(res, fabre))
+}
+result_cols <- c("setting", "trajectories", "same sign, mean speed", "same sign, mean acceleration", "same dynamics group",
+                 "gene order", "same gene order", "Fabre r", "Fabre p", "cluster ARI", "same cluster")
+```
+
+# 2. Spline settings
+
+## 2.1 Hold-out error
+
+Each internal measurement is held out, the trajectory is fitted to the others with each setting and predicts it; the
+error is divided by the VAF range of the trajectory. Linear interpolation between the two neighbours is the benchmark
+(`select_spec()` of `spline_functions.R`).
+
+```{r holdout}
+sel <- select_spec(calls)
+holdout_tab <- sel$criteria %>%
+  mutate(`relative to the best` = median_err / min(median_err[setting != "linear"])) %>%
+  transmute(setting = as.character(setting), `held-out points` = points, `median error` = median_err, `relative to the best`,
+            `mean error` = mean_err, `median |error| / binomial SE` = median_abs_z, `median effective df` = median_df)
+write_res(holdout_tab, "spline_holdout_errors.txt")
+knitr::kable(holdout_tab, digits = 3, caption = "Out-of-sample error of held-out internal measurements (error / VAF range)")
+```
+
+## 2.2 Every setting against REML
+
+```{r settings-run}
+settings_A <- setdiff(names(spec_grid), spec_main_name)
+# sequential: the DTW clustering does not survive a forked worker (mclapply), and a consensus of 30 seeds takes about a second
+res_A <- lapply(settings_A, function(s) run_setting(spec_grid[[s]])) %>% set_names(settings_A)
+stopifnot(all(map_lgl(res_A, ~ !inherits(.x, "try-error") && !is.null(.x$sum))))
+cmp_A <- map_dfr(settings_A, ~ compare_results(res_A[[.x]], main) %>% mutate(setting = .x, .before = 1))
+settings_tab <- bind_rows(tibble(setting = paste(spec_main_name, "(main)"), trajectories = length(traj_ids), `gene order` = main$gene_order,
+                                 `same gene order` = TRUE, `Fabre r` = main$fabre$r, `Fabre p` = main$fabre$p, `cluster ARI` = 1,
+                                 `same sign, mean speed` = 1, `same sign, mean acceleration` = 1, `same dynamics group` = 1, `same cluster` = 1),
+                          cmp_A) %>%
+  select(any_of(result_cols), starts_with("rho ")) %>%
+  mutate(`clusters: seeds` = n_seeds_cl)
+write_res(settings_tab, "spline_settings_comparison.txt")
+settings_tab %>% select(any_of(result_cols)) %>% knitr::kable(digits = 3, caption = "Results of the paper by spline setting (against REML)")
+```
+
+```{r fig-rho, fig.width=12, fig.height=6}
+rho_long <- function(cmp, by) {
+  cmp %>%
+    select(all_of(by), starts_with("rho ")) %>%
+    pivot_longer(starts_with("rho "), names_to = "stat", values_to = "rho") %>%
+    filter(!sub("^rho ", "", stat) %in% c("Age_zero", "Age_LoD")) %>%   # the paper uses two ages: at LoD/2 and at 2% VAF
+    mutate(stat = factor(stat_labels[sub("^rho ", "", stat)], levels = rev(unname(stat_labels[setdiff(key_stats, c("Age_zero", "Age_LoD"))]))))   # reversed: first statistic on top
+}
+rho_heat <- function(d, by, title = NULL) {
+  ggplot(d, aes(x = .data[[by]], y = stat, fill = rho)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.2f", rho)), size = 3) +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = reml_col, midpoint = 0, limits = c(-1, 1), oob = squish,
+                         name = "Spearman\nrho") +
+    labs(x = NULL, y = NULL, title = title) +
+    theme_minimal(base_size = 13) + theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 30, hjust = 1))
+}
+setting_levels <- c(names(spec_grid), "linear")
+df_lab <- sel$criteria %>% transmute(setting = as.character(setting), lab = ifelse(is.na(median_df), "", sprintf("df %.1f", median_df)))
+p_hold <- sel$errors %>%
+  mutate(setting = factor(setting, levels = setting_levels)) %>%
+  ggplot(aes(x = setting, y = err)) +
+  geom_boxplot(aes(fill = setting == spec_main_name), outlier.size = 0.5) +
+  stat_summary(fun = median, geom = "point", color = "black", size = 1.5) +
+  geom_text(data = df_lab %>% mutate(setting = factor(setting, levels = setting_levels)), aes(x = setting, y = 1.05, label = lab),
+            size = 2.6, angle = 90, hjust = 0) +
+  scale_fill_manual(values = c("TRUE" = reml_col, "FALSE" = "grey90"), guide = "none") +
+  scale_y_continuous(trans = "sqrt", limits = c(0, 1.6), breaks = c(0, 0.1, 0.25, 0.5, 1)) +
+  labs(x = NULL, y = "|error| / VAF range of the trajectory (sqrt scale)") +
+  theme_classic(base_size = 13) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_rho <- rho_heat(rho_long(cmp_A, "setting") %>% mutate(setting = factor(setting, levels = settings_A)), "setting")
+save_panel(p_hold, "supp", "FigS4_a_holdout", 6, 6)
+save_panel(p_rho, "supp", "FigS4_b_spline_settings_heatmap", 7, 6)
+p_settings <- (p_hold | p_rho) + plot_layout(widths = c(1, 1.3)) + plot_annotation(tag_levels = "a") & tag_theme
+save_supp(p_settings, "FigS4_holdout_and_spline_settings", 12, 6)
+p_settings
+```
+
+## 2.3 Four trajectories under every setting
+
+```{r fig-examples, fig.width=13, fig.height=7}
+# two trajectories by participant id and variant, then the two with the most timepoints
+example_ids <- label_tbl %>%
+  filter((SHCS_ID_new == "SHCS_7" & label == "TET2 p.H1219Y") | (SHCS_ID_new == "SHCS_6" & label == "DNMT3A p.K855Tfs*2")) %>%
+  arrange(SHCS_ID_new != "SHCS_7") %>% pull(traj_id)
+stopifnot(length(example_ids) == 2)
+example_ids <- c(example_ids, calls %>% count(traj_id) %>% arrange(desc(n), traj_id) %>% filter(!traj_id %in% example_ids) %>% slice(1:2) %>% pull(traj_id))
+stopifnot(all(example_ids %in% traj_ids))
+panel_of <- label_tbl %>% filter(traj_id %in% example_ids) %>% mutate(traj_id = factor(traj_id, levels = example_ids)) %>% arrange(traj_id)
+curve_levels <- c(VAF = "VAF", VAF_speed = "VAF speed (per year)", VAF_acceleration = "VAF acceleration (per year^2)")
+ex_curves <- bind_rows(main$pred %>% filter(traj_id %in% example_ids) %>% mutate(setting = spec_main_name),
+                       map_dfr(settings_A, ~ res_A[[.x]]$pred %>% filter(traj_id %in% example_ids) %>% mutate(setting = .x))) %>%
+  select(setting, traj_id, Age, VAF, VAF_speed, VAF_acceleration) %>%
+  pivot_longer(c(VAF, VAF_speed, VAF_acceleration), names_to = "curve", values_to = "value") %>%
+  mutate(curve = factor(curve_levels[curve], levels = curve_levels), panel = factor(panel_of$panel[match(traj_id, panel_of$traj_id)], levels = panel_of$panel),
+         setting = factor(setting, levels = names(spec_grid)))
+ex_obs <- calls %>% filter(traj_id %in% example_ids) %>%
+  mutate(curve = factor(curve_levels["VAF"], levels = curve_levels), panel = factor(panel_of$panel[match(traj_id, panel_of$traj_id)], levels = panel_of$panel))
+setting_cols <- c(setNames(c("#f4a582", "#92c5de", "#d1b26f", "#b2df8a", "#cab2d6", "#bdbdbd", "#969696", "#737373", "#525252"),
+                           c("spar 0.1", "spar 0.2", "spar 0.3", "spar 0.4", "spar 0.5", "df 2", "df 2.5", "df 3", "df 4")), REML = reml_col)
+setting_cols["spar 0.2"] <- spar02_col
+p_ex <- ggplot(ex_curves, aes(x = Age, y = value, color = setting, group = setting)) +
+  geom_hline(data = tibble(curve = factor(curve_levels[-1], levels = curve_levels), y = 0), aes(yintercept = y), linewidth = 0.3, colour = "grey60") +
+  geom_line(aes(linewidth = setting)) +
+  geom_point(data = ex_obs, aes(x = Age, y = AF, shape = source), inherit.aes = FALSE, size = 2, colour = "grey30") +
+  scale_shape_manual(values = source_shapes, labels = source_labels, name = NULL) +
+  scale_color_manual(values = setting_cols, name = "Spline") +
+  scale_linewidth_manual(values = c(setNames(rep(0.5, 9), settings_A), REML = 1.5), guide = "none") +
+  facet_grid(curve ~ panel, scales = "free", switch = "y") +
+  labs(x = "Age", y = NULL) +
+  theme_bw(base_size = 13) +
+  theme(strip.placement = "outside", strip.background = element_blank(), legend.position = "right", strip.text.x = element_text(size = 9))
+save_supp(p_ex, "FigS3_spline_settings_examples", 13, 7)
+p_ex
+```
+
+# 3. Read-count bootstrap
+
+At every measured timepoint the variant reads are redrawn, alt ~ Binomial(depth, VAF); the imputed timepoints keep
+LoD/2; the trajectory is refitted with the REML spline (`r B_boot` replicates). Per trajectory: 95% percentile intervals
+and the share of replicates with the sign of the main analysis (robust when at least 95%).
+
+```{r bootstrap}
+boot <- bootstrap_stats(calls, B = B_boot, seed = 2026)
+ci <- bootstrap_ci(boot, main$sum) %>%
+  left_join(label_tbl %>% select(traj_id, SHCS_ID_new, gene), by = "traj_id") %>%
+  select(traj_id, SHCS_ID_new, gene, stat, main, lo, hi, same_sign, robust, estimated)
+write_res(ci %>% select(-gene), "trajectory_bootstrap_ci.txt")
+
+gene_tbl <- main$sum %>% select(traj_id, Gene.refGene)
+boot_genes <- boot %>%
+  inner_join(gene_tbl, by = "traj_id") %>%
+  group_split(b) %>%
+  map_dfr(function(d) { fc <- fabre_cor(d, fabre); tibble(b = d$b[1], gene_order = gene_order(d), fabre_r = fc$r, fabre_p = fc$p) })
+width_of <- function(st) { w <- ci %>% filter(stat == st) %>% mutate(w = hi - lo); median(w$w, na.rm = TRUE) }
+boot_summary <- tibble(
+  replicates = B_boot, trajectories = length(traj_ids),
+  `mean speed: robust sign` = mean(ci$robust[ci$stat == "mean_VAF_speed"]),
+  `mean acceleration: robust sign` = mean(ci$robust[ci$stat == "mean_VAF_acceleration"]),
+  `max VAF: 95% interval width, median` = width_of("max_VAF"),
+  `age at 2% VAF: 95% interval width, median (years)` = width_of("Age_0.02"),
+  `age at LoD/2: 95% interval width, median (years)` = width_of("Age_LoD2"),
+  `replicates with the main gene order` = mean(boot_genes$gene_order == main$gene_order),
+  `Fabre r, median` = median(boot_genes$fabre_r), `Fabre r, 2.5%` = quantile(boot_genes$fabre_r, 0.025), `Fabre r, 97.5%` = quantile(boot_genes$fabre_r, 0.975),
+  `Fabre p < 0.05, share of replicates` = mean(boot_genes$fabre_p < 0.05))
+write_res(boot_summary, "bootstrap_summary.txt")
+knitr::kable(boot_summary %>% pivot_longer(everything(), names_to = "quantity", values_to = "value", values_transform = as.character), caption = "Read-count bootstrap")
+boot_genes %>% count(gene_order, name = "replicates") %>% arrange(desc(replicates)) %>% knitr::kable(caption = "Gene order of the mean speed across replicates")
+```
+
+```{r fig-bootstrap, fig.width=12, fig.height=8}
+forest <- function(st, xlab, title) {
+  d <- ci %>% filter(stat == st, !is.na(main)) %>% mutate(traj_id = fct_reorder(traj_id, main))
+  ggplot(d, aes(y = traj_id, x = main, xmin = lo, xmax = hi, color = gene, alpha = robust)) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_pointrange(size = 0.15, linewidth = 0.4) +
+    scale_color_manual(values = gene_colors, name = "Gene") +
+    scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.3), name = "Sign robust\n(>= 95% of replicates)") +
+    labs(y = "Trajectory", x = xlab, title = title) +
+    theme_bw(base_size = 13) + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), panel.grid.minor = element_blank())
+}
+age_forest <- function(st, xlab, title) {
+  d <- ci %>% filter(stat == st, !is.na(main)) %>% mutate(traj_id = fct_reorder(traj_id, main))
+  ggplot(d, aes(y = traj_id, x = main, xmin = lo, xmax = hi, color = gene)) +
+    geom_pointrange(size = 0.15, linewidth = 0.4) +
+    scale_color_manual(values = gene_colors, name = "Gene") +
+    labs(y = "Trajectory", x = xlab, title = title) +
+    theme_bw(base_size = 13) + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), panel.grid.minor = element_blank())
+}
+p_boot <- (forest("mean_VAF_speed", "mean VAF speed (per year), 95% bootstrap interval", "a. Mean VAF speed") |
+           forest("mean_VAF_acceleration", "mean VAF acceleration (per year^2), 95% bootstrap interval", "b. Mean VAF acceleration")) /
+  (age_forest("Age_0.02", "age at 2% VAF (years), 95% bootstrap interval", "c. Age at 2% VAF") |
+   age_forest("Age_LoD2", "age at LoD/2 (years), 95% bootstrap interval", "d. Age at LoD/2 (extrapolated)")) +
+  plot_layout(guides = "collect") & theme(legend.position = "right")
+save_extra(p_boot, "bootstrap_intervals", 12, 8)
+p_boot
+```
+
+# 4. Value of the not detected timepoints
+
+In the main analysis a not detected timepoint has half the LoD of the timepoint. Alternatives: 0,
+LoD/4, the LoD, and the timepoint removed. A trajectory with fewer than 3 points
+left cannot be smoothed. The per-trajectory agreement is computed on the trajectories a scenario changes.
+
+```{r imputation}
+scenarios <- c("0", "LoD/4", "LoD", "without non-detected")
+scenario_calls <- function(calls, scenario) {
+  imputed_as <- function(f) calls %>% mutate(AF = ifelse(source == "imputed", f * lod_vaf, AF))
+  switch(scenario, "0" = imputed_as(0), "LoD/4" = imputed_as(0.25), "LoD" = imputed_as(1),
+         "without non-detected" = calls %>% filter(source != "imputed"))
+}
+affected_by <- function(sc) calls %>%
+  left_join(sc %>% select(traj_id, Age, AF_sc = AF), by = c("traj_id", "Age")) %>%
+  filter(is.na(AF_sc) | abs(AF_sc - AF) > 1e-12) %>% pull(traj_id) %>% unique()
+res_D <- lapply(scenarios, function(s) {
+  sc <- scenario_calls(calls, s)
+  keep <- sc %>% count(traj_id) %>% filter(n >= 3) %>% pull(traj_id)
+  r <- run_setting(spec_main, calls_in = sc %>% filter(traj_id %in% keep))
+  r$affected <- affected_by(sc)
+  r$lost <- setdiff(traj_ids, keep)
+  r
+}) %>% set_names(scenarios)
+stopifnot(all(map_lgl(res_D, ~ !is.null(.x$sum))))
+cmp_D <- map_dfr(scenarios, ~ compare_results(res_D[[.x]], main, subset = res_D[[.x]]$affected) %>%
+                   mutate(setting = .x, `trajectories changed` = length(res_D[[.x]]$affected), `trajectories lost` = length(res_D[[.x]]$lost), .before = 1))
+imput_tab <- bind_rows(tibble(setting = "LoD/2 (main)", `trajectories changed` = 0L, `trajectories lost` = 0L, `gene order` = main$gene_order, `same gene order` = TRUE,
+                              `Fabre r` = main$fabre$r, `Fabre p` = main$fabre$p, `cluster ARI` = 1, `same sign, mean speed` = 1, `same sign, mean acceleration` = 1),
+                       cmp_D) %>%
+  select(setting, `trajectories changed`, `trajectories lost`, any_of(result_cols), starts_with("rho ")) %>%
+  mutate(`clusters: seeds` = n_seeds_cl)
+write_res(imput_tab, "imputation_sensitivity.txt")
+imput_tab %>% select(-starts_with("rho ")) %>% knitr::kable(digits = 3, caption = "Results of the paper by value of the not detected timepoints")
+```
+
+```{r fig-imputation, fig.width=11, fig.height=5}
+p_imp_heat <- rho_heat(rho_long(cmp_D, "setting") %>% mutate(setting = factor(setting, levels = scenarios)), "setting")
+imp_long <- imput_tab %>%
+  transmute(setting = factor(setting, levels = c("LoD/2 (main)", scenarios)), `Fabre r` = `Fabre r`, `cluster ARI` = `cluster ARI`,
+            `same sign of\nmean speed` = `same sign, mean speed`, `same sign of\nmean acceleration` = `same sign, mean acceleration`) %>%
+  pivot_longer(-setting, names_to = "quantity", values_to = "value") %>%
+  mutate(quantity = fct_inorder(quantity))
+p_imp_bars <- ggplot(imp_long, aes(x = setting, y = value, fill = setting == "LoD/2 (main)")) +
+  geom_col(width = 0.7, colour = "grey30", linewidth = 0.2) +
+  geom_text(aes(label = sprintf("%.2f", value)), angle = 90, hjust = -0.15, size = 2.5) +
+  facet_wrap(~quantity, nrow = 1) +
+  scale_fill_manual(values = c("TRUE" = reml_col, "FALSE" = "grey80"), guide = "none") +
+  scale_y_continuous(limits = c(0, 1.35), breaks = c(0, 0.5, 1)) +
+  labs(x = "Value of the not detected timepoints", y = NULL) +
+  theme_classic(base_size = 13) + theme(axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_blank())
+p_imp <- (p_imp_heat | p_imp_bars) + plot_layout(widths = c(1, 1.2)) + plot_annotation(tag_levels = "a") & tag_theme
+save_extra(p_imp, "imputation_sensitivity", 11, 5)
+p_imp
+```
+
+# 5. The cross-sectional screening calls
+
+The calls of the earlier cross-sectional screening assay inserted into the trajectories
+(`resources/LoD/cross_sectional/chip_calls_long_filtered.txt`), fitted with REML and with `spar` = 0.2,
+against the main analysis (agreement on the trajectories that gain a point). The file is not part of this
+repository; the section runs only if that file is present.
+
+```{r cross, eval = file.exists(file.path(rev$cross_resources, "chip_calls_long_filtered.txt"))}
+calls_cross <- read_tsv_(file.path(rev$cross_resources, "chip_calls_long_filtered.txt")) %>%
+  inner_join(ids, by = "ID") %>%
+  mutate(source = factor(source, levels = names(source_shapes)))
+lod_cross <- calls_cross %>% distinct(traj_id, lod = traj_lod_mean)
+gain_point <- intersect(calls_cross$traj_id[calls_cross$type == "cross"], traj_ids)
+res_E <- list(`REML + cross-sectional calls` = run_setting(spec_main, calls_in = calls_cross, lod = lod_cross),
+              `spar 0.2 + cross-sectional calls` = run_setting(spec_grid[["spar 0.2"]], calls_in = calls_cross, lod = lod_cross))
+cmp_E <- imap_dfr(res_E, ~ compare_results(.x, main, subset = gain_point) %>% mutate(setting = .y, .before = 1))
+cmp_E %>% select(any_of(result_cols)) %>% knitr::kable(digits = 3, caption = sprintf("With the cross-sectional calls (%d trajectories gain a point; agreement on those)", length(gain_point)))
+```
+
+# 6. Simulation: what the design identifies
+
+Clones with a constant fitness *s* are simulated (logistic growth of the clone fraction with genetic drift, binomial
+sequencing noise), from a VAF of 1% at age 52 for 20
+years, sequenced at depth 2,000 with the median LoD of the study (0.28%; a timepoint without a variant read is set to
+LoD/2, as in SHCS), and re-fitted from the measured VAF sampled every 1, 2, 3 or 5 years with the REML spline of the
+main analysis and with the `spar` = 0.2 spline. The reference of each trajectory is the REML spline fitted to its
+true (noise-free) VAF of every year; the errors of the mean speed and the mean acceleration are taken over the ages the
+fit covers.
+
+```{r sim-functions}
+# The simulation model: Moran drift on the logit scale when the clone has many lineages, a Poisson-Gamma birth-death
+# step when it is rare, binomial reads.
+growth_up <- function(s, dt) if (s == 0) dt else expm1(s * dt) / s
+growth_down <- function(s, dt) if (s == 0) dt else -expm1(-s * dt) / s
+lineage_scale <- function(s, dt, N_tau) growth_up(s, dt) / N_tau
+n_lineages <- function(x, s, dt, N_tau) x * exp(s * dt) / lineage_scale(s, dt, N_tau)
+rare_step <- function(x, s, dt, N_tau) {
+  K <- rpois(1, n_lineages(x, s, dt, N_tau))
+  if (K == 0) 0 else rgamma(1, K, scale = lineage_scale(s, dt, N_tau))
+}
+next_x <- function(x, s, N_tau, dt = 1, min_lineages = 100) {
+  if (x <= 0 || x >= 1) return(x)
+  if (n_lineages(x, s, dt, N_tau) < min_lineages) return(min(rare_step(x, s, dt, N_tau), 1))
+  if (n_lineages(1 - x, -s, dt, N_tau) < min_lineages) return(max(1 - rare_step(1 - x, -s, dt, N_tau), 0))
+  o <- x / (1 - x)
+  A <- growth_down(s, dt) / o
+  B <- o * growth_up(s, dt)
+  plogis(rnorm(1, qlogis(x) + s * dt + (B - A) / N_tau, sqrt(2 * (A + 2 * dt + B) / N_tau)))
+}
+simulate_trajectory <- function(vaf0, s, years = 20, N_tau = 1e5) {
+  stopifnot(vaf0 >= 0, vaf0 <= 0.5)
+  x <- numeric(years + 1)
+  x[1] <- 2 * vaf0
+  for (i in seq_len(years)) x[i + 1] <- next_x(x[i], s, N_tau)
+  tibble(year = 0:years, VAF = x / 2)
+}
+add_reads <- function(d, depth = 2000) mutate(d, alt_reads = rbinom(n(), depth, VAF), VAF_obs = alt_reads / depth)
+logistic_vaf <- function(vaf0, s, year) plogis(qlogis(2 * vaf0) + s * year) / 2
+```
+
+```{r sim-trajectories}
+vaf0 <- 0.01
+s_grid <- c(0, 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5)
+n_rep <- if (quick) 4 else 100
+years <- 20
+N_tau <- 1e5
+depth <- 2000
+start_age <- 52
+lod_sim <- 0.0028
+every_grid <- c(1, 2, 3, 5)
+every_names <- setNames(ifelse(every_grid == 1, "every year", paste("every", every_grid, "years")), every_grid)
+
+# 10 trajectories per s with seed 1, then 90 more with seed 2
+set.seed(1)
+traj_1 <- expand_grid(s = s_grid, rep = seq_len(min(10, n_rep))) %>%
+  mutate(traj = map(s, ~ simulate_trajectory(vaf0, .x, years, N_tau))) %>% unnest(traj) %>% add_reads(depth)
+set.seed(2)
+traj_2 <- if (n_rep > 10) expand_grid(s = s_grid, rep = seq_len(n_rep)) %>% filter(rep > 10) %>%
+  mutate(traj = map(s, ~ simulate_trajectory(vaf0, .x, years, N_tau))) %>% unnest(traj) %>% add_reads(depth) else NULL
+sim <- bind_rows(traj_1, traj_2) %>%
+  mutate(traj_id = paste(s, rep, sep = "_"), Age = start_age + year, AF_true = VAF,
+         AF_meas = ifelse(alt_reads == 0, lod_sim / 2, VAF_obs))
+sim_ids <- sim %>% distinct(traj_id, s, rep)
+cat(nrow(sim_ids), "simulated trajectories;", sum(sim$year == years & sim$VAF == 0), "lost by year 20\n")
+```
+
+```{r sim-fits}
+# one fit: curve every 0.5 years within the fitted ages, mean speed and mean acceleration; NULL if it cannot be fitted
+fit_one <- function(age, af, spec) {
+  f <- fit_traj(age, af, spec)
+  if (is.null(f)) return(NULL)
+  spline_curves(f$predict, curve_ages(age, f$predict, FALSE)) %>% mutate(df = f$df)
+}
+curve_stats <- function(cv) tibble(mean_speed = mean(cv$VAF_speed), mean_acc = mean(cv$VAF_acceleration), max_speed = max(cv$VAF_speed),
+                                   max_VAF = max(cv$VAF), min_Age = min(cv$Age), max_Age = max(cv$Age), df = cv$df[1])
+sim_split <- split(sim, sim$traj_id)
+spec_spar <- spec_grid[["spar 0.2"]]
+
+# reference: REML on the true VAF of every year
+ref_curves <- parallel::mclapply(names(sim_split), function(id) {
+  d <- sim_split[[id]]
+  fit_one(d$Age, d$AF_true, spec_main) %>% mutate(traj_id = id)
+}, mc.cores = n_cores) %>% bind_rows()
+ref_stats <- ref_curves %>% group_by(traj_id) %>% group_modify(~ curve_stats(.x)) %>% ungroup()
+ref_within <- function(id, lo, hi) {   # reference statistics over the ages a fit covers
+  r <- ref_curves[ref_curves$traj_id == id & ref_curves$Age >= lo - 1e-9 & ref_curves$Age <= hi + 1e-9, ]
+  c(ref_speed = mean(r$VAF_speed), ref_acc = mean(r$VAF_acceleration))
+}
+
+# the fits of the measured VAF: every interval x both splines
+fit_grid <- expand_grid(every = every_grid, spline = c("REML", "spar 0.2"))
+sim_fits <- parallel::mclapply(names(sim_split), function(id) {
+  d <- sim_split[[id]]
+  pmap_dfr(fit_grid, function(every, spline) {
+    dd <- d[d$year %% every == 0, ]
+    cv <- fit_one(dd$Age, dd$AF_meas, if (spline == "REML") spec_main else spec_spar)
+    if (is.null(cv)) return(NULL)
+    st <- curve_stats(cv)
+    rw <- ref_within(id, st$min_Age, st$max_Age)
+    bind_cols(tibble(traj_id = id, every = every, spline = spline), st, as_tibble(as.list(rw)))
+  })
+}, mc.cores = n_cores) %>% bind_rows() %>% left_join(sim_ids, by = "traj_id")
+
+sim_errors <- sim_fits %>%
+  group_by(s, every, spline) %>%
+  summarise(trajectories = n(),
+            `median relative error of mean speed` = median(abs(mean_speed - ref_speed)[ref_speed > 0] / ref_speed[ref_speed > 0]),
+            `median absolute error of mean speed` = median(abs(mean_speed - ref_speed)),
+            `Spearman rho of mean speed` = suppressWarnings(cor(mean_speed, ref_speed, method = "spearman")),
+            `same sign of mean speed` = mean(sign(mean_speed) == sign(ref_speed)),
+            `median absolute error of mean acceleration` = median(abs(mean_acc - ref_acc)),
+            `median |reference mean acceleration|` = median(abs(ref_acc)),
+            `Spearman rho of mean acceleration` = suppressWarnings(cor(mean_acc, ref_acc, method = "spearman")),
+            `same sign of mean acceleration` = mean(sign(mean_acc) == sign(ref_acc)),
+            `median effective df` = median(df), .groups = "drop") %>%
+  mutate(sampling = every_names[as.character(every)], .after = every)
+sim_pooled <- sim_fits %>%
+  filter(s > 0) %>%
+  group_by(every, spline) %>%
+  summarise(trajectories = n(),
+            `Spearman rho of mean speed, all s pooled` = cor(mean_speed, ref_speed, method = "spearman"),
+            `Spearman rho of mean acceleration, all s pooled` = cor(mean_acc, ref_acc, method = "spearman"),
+            `same sign of mean speed` = mean(sign(mean_speed) == sign(ref_speed)),
+            `same sign of mean acceleration` = mean(sign(mean_acc) == sign(ref_acc)),
+            `median relative error of mean speed` = median(abs(mean_speed - ref_speed)[ref_speed > 0] / ref_speed[ref_speed > 0]),
+            `median relative error of mean acceleration` = median(abs(mean_acc - ref_acc)[ref_acc > 0] / ref_acc[ref_acc > 0]), .groups = "drop") %>%
+  mutate(sampling = every_names[as.character(every)], .after = every)
+sim_errors <- sim_errors %>%
+  left_join(sim_fits %>% group_by(s, every, spline) %>%
+              summarise(`median relative error of mean acceleration` = median(abs(mean_acc - ref_acc)[ref_acc > 0] / ref_acc[ref_acc > 0]), .groups = "drop"),
+            by = c("s", "every", "spline"))
+write_res(sim_errors, "simulation_REML_errors.txt")
+write_res(sim_pooled, "simulation_REML_pooled.txt")
+knitr::kable(sim_pooled, digits = 3, caption = "All fitness values pooled (s > 0): the fitted against the reference statistics across the trajectories")
+sim_errors %>% filter(every == 5) %>% select(s, spline, `median relative error of mean speed`, `Spearman rho of mean speed`, `same sign of mean speed`,
+                                             `median absolute error of mean acceleration`, `median relative error of mean acceleration`, `Spearman rho of mean acceleration`, `same sign of mean acceleration`) %>%
+  knitr::kable(digits = 3, caption = "Sampling every 5 years: recovery of the mean speed and the mean acceleration")
+sim_errors %>% filter(spline == "REML") %>% select(s, sampling, `median relative error of mean speed`, `Spearman rho of mean speed`, `Spearman rho of mean acceleration`) %>%
+  knitr::kable(digits = 3, caption = "REML spline by sampling interval")
+```
+
+```{r fig-simulation, fig.width=13, fig.height=10}
+# a. the first trajectory of each s: measured points, REML fit to every year (black) and every 5 years (red)
+first_ids <- sim_ids %>% filter(rep == 1) %>% pull(traj_id)
+panel_curves <- parallel::mclapply(first_ids, function(id) {
+  d <- sim_split[[id]]
+  bind_rows(fit_one(d$Age, d$AF_meas, spec_main) %>% mutate(fit = "every year"),
+            fit_one(d$Age[d$year %% 5 == 0], d$AF_meas[d$year %% 5 == 0], spec_main) %>% mutate(fit = "every 5 years")) %>%
+    mutate(traj_id = id)
+}, mc.cores = n_cores) %>% bind_rows() %>% left_join(sim_ids, by = "traj_id")
+measure_levels <- c(VAF = "VAF", VAF_speed = "Speed\n(VAF / year)", VAF_acceleration = "Acceleration\n(VAF / year^2)")
+pc <- panel_curves %>%
+  pivot_longer(c(VAF, VAF_speed, VAF_acceleration), names_to = "measure", values_to = "value") %>%
+  mutate(measure = factor(measure_levels[measure], levels = measure_levels), s_lab = factor(paste("s =", s), levels = paste("s =", s_grid)),
+         fit = factor(fit, levels = c("every year", "every 5 years")))
+pts <- sim %>% filter(rep == 1) %>%
+  transmute(s_lab = factor(paste("s =", s), levels = paste("s =", s_grid)), Age, value = AF_meas, measure = factor(measure_levels[["VAF"]], levels = measure_levels),
+            sampled = year %% 5 == 0)
+p_a <- ggplot(pc, aes(x = Age - start_age, y = value)) +
+  geom_point(data = pts, aes(alpha = sampled), colour = "grey40", size = 1.1) +
+  geom_line(aes(colour = fit, linewidth = fit)) +
+  scale_colour_manual(values = c("every year" = "black", "every 5 years" = reml_col), name = "REML fit to the points") +
+  scale_linewidth_manual(values = c("every year" = 1.1, "every 5 years" = 0.8), name = "REML fit to the points") +
+  scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.35), labels = c("TRUE" = "every 5 years", "FALSE" = "other years"), name = "Measured VAF") +
+  facet_grid(measure ~ s_lab, scales = "free_y", switch = "y") +
+  labs(x = "Years since the start (age 52)", y = NULL) +
+  theme_bw(base_size = 12) + theme(strip.placement = "outside", strip.background = element_blank(), legend.position = "top", axis.text = element_text(size = 7),
+                                   strip.text.y.left = element_text(angle = 90))
+
+# b. fitted against reference mean speed, 5-year sampling
+s_colors <- setNames(colorRampPalette(c("#86b6ef", "#0d366b"))(length(s_grid)), s_grid)
+p_b <- sim_fits %>% filter(every == 5, spline == "REML") %>%
+  ggplot(aes(x = ref_speed, y = mean_speed, colour = factor(s))) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(size = 0.8, alpha = 0.7) +
+  scale_x_continuous(breaks = c(0, 0.01, 0.02)) + scale_y_continuous(breaks = c(0, 0.01, 0.02)) +
+  scale_colour_manual(values = s_colors, name = "s (per year)") +
+  labs(x = "Reference mean speed\n(REML on the true VAF of every year)", y = "Fitted mean speed, sampling every 5 years") +
+  theme_bw(base_size = 12) + theme(strip.background = element_blank())
+
+# c, d. errors by s and sampling interval
+err_long <- sim_errors %>% filter(s > 0, spline == "REML") %>%
+  mutate(sampling = factor(sampling, levels = every_names))
+p_c <- ggplot(err_long, aes(x = s, y = `median relative error of mean speed`, colour = sampling)) +
+  geom_line() + geom_point(size = 1.2) +
+  scale_x_log10(breaks = c(0.01, 0.025, 0.05, 0.1, 0.2, 0.5), labels = c("0.01", "0.025", "0.05", "0.1", "0.2", "0.5")) +
+  scale_y_continuous(labels = percent, limits = c(0, NA)) +
+  scale_colour_manual(values = c("every year" = "black", "every 2 years" = "#f4a09a", "every 3 years" = "#e8655f", "every 5 years" = reml_col), name = "Sampling") +
+  labs(x = "Fitness s (per year, log scale)", y = "Median relative error of the mean speed") +
+  theme_bw(base_size = 12)
+p_d <- ggplot(err_long, aes(x = s, y = `median absolute error of mean acceleration`, colour = sampling)) +
+  geom_line() + geom_point(size = 1.2) +
+  geom_line(data = err_long %>% filter(every == 1, spline == "REML"), aes(y = `median |reference mean acceleration|`, group = 1), colour = "grey50", linetype = "dotted", linewidth = 0.8) +
+  scale_x_log10(breaks = c(0.01, 0.025, 0.05, 0.1, 0.2, 0.5), labels = c("0.01", "0.025", "0.05", "0.1", "0.2", "0.5")) +
+  scale_colour_manual(values = c("every year" = "black", "every 2 years" = "#f4a09a", "every 3 years" = "#e8655f", "every 5 years" = reml_col), name = "Sampling") +
+  labs(x = "Fitness s (per year, log scale)", y = "Median absolute error of the mean acceleration\n(VAF / year^2; dotted: median |reference acceleration|)") +
+  theme_bw(base_size = 12)
+save_panel(p_a, "supp", "FigS5_simulation_a_curves", 13, 5.5)
+save_panel(p_b, "supp", "FigS5_simulation_b_mean_speed", 5, 4.5)
+save_panel(p_c, "supp", "FigS5_simulation_c_speed_error", 5, 4.5)
+save_panel(p_d, "supp", "FigS5_simulation_d_acceleration_error", 5, 4.5)
+p_sim <- p_a / ((p_b | p_c | p_d) + plot_layout(widths = c(1.1, 1, 1))) + plot_layout(heights = c(1.1, 1)) + plot_annotation(tag_levels = "a") & tag_theme
+save_supp(p_sim, "FigS5_simulation_REML", 13, 10)
+p_sim
+```
+
+# 7. Overview of the sensitivity analyses
+
+```{r overview}
+pick <- function(cmp, analysis) cmp %>%
+  transmute(analysis, setting, `trajectories compared` = trajectories, `gene order` = `gene order`, `same gene order` = `same gene order`,
+            `Fabre r` = `Fabre r`, `Fabre p` = `Fabre p`, `cluster ARI` = `cluster ARI`,
+            `same sign, mean speed` = `same sign, mean speed`, `same sign, mean acceleration` = `same sign, mean acceleration`,
+            `rho mean speed` = `rho mean_VAF_speed`, `rho max VAF` = `rho max_VAF`, `rho mean acceleration` = `rho mean_VAF_acceleration`,
+            `rho age at 2% VAF` = `rho Age_0.02`)
+overview <- bind_rows(
+  tibble(analysis = "main analysis", setting = "REML, not detected at LoD/2, longitudinal assay", `trajectories compared` = length(traj_ids),
+         `gene order` = main$gene_order, `same gene order` = TRUE, `Fabre r` = main$fabre$r, `Fabre p` = main$fabre$p, `cluster ARI` = 1,
+         `same sign, mean speed` = 1, `same sign, mean acceleration` = 1, `rho mean speed` = 1, `rho max VAF` = 1, `rho mean acceleration` = 1, `rho age at 2% VAF` = 1),
+  pick(cmp_A, "spline setting"),
+  pick(cmp_D, "value of the not detected timepoints") %>% mutate(setting = paste("not detected at", setting)),
+  if (exists("cmp_E")) pick(cmp_E, "cross-sectional screening calls"),
+  tibble(analysis = "read-count bootstrap", setting = sprintf("%d replicates", B_boot), `trajectories compared` = length(traj_ids),
+         `gene order` = sprintf("main order in %.0f%% of replicates", 100 * boot_summary$`replicates with the main gene order`),
+         `same gene order` = boot_summary$`replicates with the main gene order` >= 0.5,
+         `Fabre r` = boot_summary$`Fabre r, median`, `Fabre p` = NA_real_, `cluster ARI` = NA_real_,
+         `same sign, mean speed` = boot_summary$`mean speed: robust sign`, `same sign, mean acceleration` = boot_summary$`mean acceleration: robust sign`,
+         `rho mean speed` = NA_real_, `rho max VAF` = NA_real_, `rho mean acceleration` = NA_real_, `rho age at 2% VAF` = NA_real_)) %>%
+  mutate(note = case_when(analysis == "read-count bootstrap" ~ "same sign = share of trajectories whose sign holds in >= 95% of replicates; Fabre r = median over replicates",
+                          analysis == "value of the not detected timepoints" ~ "agreement computed on the trajectories the scenario changes",
+                          analysis == "cross-sectional screening calls" ~ "agreement computed on the trajectories that gain a point",
+                          TRUE ~ ""))
+write_res(overview, "sensitivity_overview.txt")
+overview %>% select(-note) %>% knitr::kable(digits = 3, caption = "Overview of the sensitivity analyses against the main analysis")
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,223 @@
+---
+title: "Figure 4 (PWH against the SardiNIA general population) and Figures S11-S18"
+author: "Valeriia Timonina"
+date: "2026-11-06"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+Figure 4 and the supplementary figures of the cohort comparison (Figures S11-S18), on the REML curves of the
+LoD trajectories of both cohorts (`resources/LoD/`, the 5 main genes only): the trajectories of both cohorts, the mixed
+models of log10 VAF on age and cohort with the measured data (all trajectories and by cluster, the SardiNIA trajectories
+assigned to the final consensus clusters by `03_consensus_clusters.Rmd`), the per-trajectory summary statistics
+including the age at LoD/2 and at 2% VAF, the matching sets, the models with the interaction and by gene, and the summary
+statistics of every set. The models with sex and smoking (`02_cohort_characteristics_sex_smoking.Rmd`) are reported
+in the text.
+
+```{r libraries}
+source("R/paper_functions.R")
+library(ggExtra)
+
+sets <- set_names(set_keys) %>% map(~ read_set(.x, "5"))
+ages <- bind_rows(load_ages(), load_sard_ages())
+cl <- load_final_clusters(); cl_sard <- load_final_sard_clusters()
+cl_all <- bind_rows(cl %>% select(traj_id, cluster, label), cl_sard %>% select(traj_id, cluster, label))
+k_cl <- n_distinct(cl$cluster)
+lab_map <- cluster_label_map(cl)
+for (d in c(file.path(paper$figure(4), "panels"), file.path(paper$supp, "panels"), file.path(rev$figures, "panels"))) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+coef_saved_file <- file.path(rev$lod_results, "SHCS_Sardinia_mixed_models_coefficients.txt")   # optional check against an earlier version of the analysis
+imap_dfr(sets, ~ .x %>% group_by(Cohort) %>% summarise(set = set_labels[[.y]], trajectories = n_distinct(traj_id), individuals = n_distinct(ID), `age range` = paste(range(Age), collapse = "-"), .groups = "drop")) %>%
+  knitr::kable(caption = "The four sets, 5 main genes")
+```
+
+# 1. Figure 4a: all trajectories of both cohorts (unmatched set)
+
+```{r fig4a, fig.width=6, fig.height=5}
+margin_plot <- function(d, size = 15, legend = TRUE) {
+  n <- d %>% group_by(Cohort) %>% summarise(n = n_distinct(traj_id), .groups = "drop")
+  p <- d %>% group_by(traj_id) %>% filter(n() > 1) %>% ungroup() %>%
+    mutate(Cohort = factor(Cohort, levels = c("SardiNIA", "SHCS"))) %>%
+    ggplot(aes(x = Age, y = VAF, color = Cohort, group = traj_id)) +
+    geom_point(size = 0) + geom_line(alpha = 0.55, linewidth = 0.5) +
+    geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+    annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5, label = sprintf("SHCS, N=%d", n$n[n$Cohort == "SHCS"]), colour = "red3", fontface = "bold", size = 3.8) +
+    annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 3.2, label = sprintf("SardiNIA, N=%d", n$n[n$Cohort == "SardiNIA"]), colour = "grey44", fontface = "bold", size = 3.8) +
+    scale_color_manual(values = cohort_colors, name = NULL) +
+    scale_y_continuous(labels = percent, limits = c(0, 0.41)) +
+    theme_classic(base_size = size) + theme(legend.position = "none")
+  ggMarginal(p, type = "density", margins = "x", groupColour = TRUE, groupFill = TRUE, size = 6)
+}
+p_5a <- margin_plot(sets$unmatched)
+for (e in c("png", "svg")) ggsave(file.path(paper$figure(4), "panels", paste0("Fig4a_trajectories_both_cohorts.", e)), p_5a, width = 6, height = 5, dpi = 300, bg = "white")
+grid::grid.newpage(); grid::grid.draw(p_5a)
+```
+
+# 2. Mixed models of log10 VAF on age and cohort
+
+```{r mm}
+datasets <- map(sets, ~ .x %>% filter(data_point == 1))
+genes <- c("All", main_genes)
+results <- list()
+for (dn in names(datasets)) for (gene in genes) for (zero in c(TRUE, FALSE)) {
+  label <- paste(dn, gene, "slope", if (zero) "zero" else "", sep = ".")
+  results[[label]] <- fit_cohort_model(datasets[[dn]], gene == "All" | Gene == gene, random_slope = TRUE, zero = zero)
+}
+coef_all <- all_cohort_coefficients(results)
+if (file.exists(coef_saved_file)) {
+  coef_saved <- read_tsv_(coef_saved_file)
+  chk <- inner_join(coef_all %>% filter(Term %in% c("Age", "HIV", "Age:HIV")), coef_saved %>% filter(Term %in% c("Age", "HIV", "Age:HIV")), by = c("label", "Term"), suffix = c("", ".saved"))
+  stopifnot(nrow(chk) > 0, max(abs(chk$Estimate - chk$Estimate.saved)) < 1e-4)
+}
+results_cl <- list()
+for (dn in names(datasets)) for (k in seq_len(k_cl)) {
+  d <- datasets[[dn]] %>% inner_join(cl_all %>% select(traj_id, cluster), by = "traj_id")
+  results_cl[[paste(dn, k, sep = ".")]] <- fit_cohort_model(d, cluster == k, random_slope = TRUE, zero = TRUE)
+}
+coef_cl <- all_cohort_coefficients(results_cl)
+write_res(bind_rows(coef_all %>% mutate(level = "all / gene"), coef_cl %>% mutate(level = "cluster")), "fig4_mixed_models_coefficients.txt")
+hiv_tab <- bind_rows(coef_all %>% filter(grepl("slope.zero$", label)) %>% mutate(group = sub("^[a-z_]+\\.([A-Za-z0-9]+)\\..*", "\\1", label)),
+                     coef_cl %>% mutate(group = paste(lab_map[sub("^[a-z_]+\\.([0-9])$", "\\1", label)], "cluster"))) %>%
+  filter(Term == "HIV") %>%
+  mutate(set = factor(sub("\\..*", "", label), levels = set_keys, labels = set_labels[set_keys]),
+         cell = sprintf("%.2f (%.2f to %.2f), p = %s; n = %d", Estimate, `CI Lower`, `CI Upper`, fmt_p(`p-value`), trajectories)) %>%
+  select(set, group, cell) %>% pivot_wider(names_from = set, values_from = cell)
+knitr::kable(hiv_tab, caption = "HIV effect on log10 VAF (random slope, no interaction)")
+knitr::kable(coef_all %>% filter(grepl("All.slope.$", label), Term == "Age:HIV") %>% select(label, Estimate, `CI Lower`, `CI Upper`, `p-value`), digits = 4, caption = "Age x HIV interaction")
+knitr::kable(bind_rows(cl %>% mutate(Cohort = "SHCS"), cl_sard %>% mutate(Cohort = "SardiNIA")) %>% filter(traj_id %in% datasets$unmatched$traj_id) %>%
+               count(Cohort, cluster, label) %>% group_by(Cohort) %>% mutate(share = sprintf("%.0f%%", 100 * n / sum(n))), caption = "Clusters by cohort (unmatched set, 5 genes)")
+```
+
+```{r fig4b-clusters, fig.width=16, fig.height=5}
+p_5b <- cohort_model_panel(results[["unmatched.All.slope.zero"]])
+p_cl <- map(seq_len(k_cl), function(k) {
+  d <- results_cl[[paste0("unmatched.", k)]]$data %>% mutate(panel = paste0("\"", lab_map[[as.character(k)]], "\" cluster"))
+  cohort_model_panel(results_cl[[paste0("unmatched.", k)]])
+})
+# the facet strip needs the panel variable in the data: add it
+for (k in seq_len(k_cl)) { m <- results_cl[[paste0("unmatched.", k)]]; m$data$panel <- paste0("\"", lab_map[[as.character(k)]], "\" cluster")
+  p_cl[[k]] <- cohort_model_panel(m) }
+save_panel(p_5b, 4, "Fig4b_mixed_model_all", 6, 5)
+for (k in seq_len(k_cl)) save_panel(p_cl[[k]], 4, paste0("Fig4", letters[2 + k], "_mixed_model_cluster_", k), 6, 5)
+p_5bc <- wrap_plots(c(list(p_5b), p_cl), nrow = 1) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+p_5bc
+```
+
+# 3. Summary statistics of the trajectories (unmatched set, 5 genes)
+
+```{r fig4stats, fig.width=15, fig.height=6}
+sums <- map(sets, ~ set_summary(.x, ages))
+panels_st <- c(max_VAF = "VAF (max)", mean_VAF_speed = "VAF speed (mean)", max_VAF_speed = "VAF speed (max)", sd_VAF_speed = "VAF speed (sd)",
+               mean_VAF_acceleration = "VAF acceleration (mean)", max_VAF_acceleration = "VAF acceleration (max)", sd_VAF_acceleration = "VAF acceleration (sd)",
+               Age_LoD2 = "Age at LoD/2", Age_0.02 = "Age at 2% VAF")
+hlines <- c(max_VAF = chip_vaf, mean_VAF_speed = 0, max_VAF_speed = 0, mean_VAF_acceleration = 0, max_VAF_acceleration = 0)
+stat_panels <- imap(panels_st, ~ cohort_box(sums$unmatched, .y, .x, if (.y %in% names(hlines)) hlines[[.y]] else NULL))
+first_letter <- 2 + k_cl + 1
+for (i in seq_along(stat_panels)) save_panel(stat_panels[[i]], 4, paste0("Fig4", letters[first_letter + i - 1], "_", names(panels_st)[i]), 3, 3.3)
+p_5st <- wrap_plots(stat_panels, nrow = 2)
+p_5st
+```
+
+```{r tests}
+stat_groups <- list(
+  VAF = c(mean_VAF = "VAF (mean)", min_VAF = "VAF (min)", max_VAF = "VAF (max)", sd_VAF = "VAF (sd)"),
+  Speed = c(mean_VAF_speed = "VAF speed (mean)", min_VAF_speed = "VAF speed (min)", max_VAF_speed = "VAF speed (max)", sd_VAF_speed = "VAF speed (sd)"),
+  Acceleration = c(mean_VAF_acceleration = "VAF acceleration (mean)", min_VAF_acceleration = "VAF acceleration (min)", max_VAF_acceleration = "VAF acceleration (max)", sd_VAF_acceleration = "VAF acceleration (sd)"),
+  Age = c(mean_Age = "Age (mean)", min_Age = "Age (min)", max_Age = "Age (max)"),
+  `Age at a VAF` = c(Age_LoD2 = "Age at LoD/2", Age_0.02 = "Age at 2% VAF"))
+all_stats <- unlist(unname(stat_groups))
+wilcox_row <- function(s, stat) {
+  x <- s[[stat]][s$Cohort == "SHCS"]; y <- s[[stat]][s$Cohort == "SardiNIA"]
+  x <- x[!is.na(x)]; y <- y[!is.na(y)]
+  tibble(statistic = all_stats[[stat]], stat = stat, n_SHCS = length(x), n_SardiNIA = length(y), median_SHCS = median(x), median_SardiNIA = median(y),
+         p = wilcox.test(x, y, exact = FALSE)$p.value)
+}
+tests <- imap_dfr(sums, ~ map_dfr(names(all_stats), function(st) wilcox_row(.x, st)) %>% mutate(set = set_labels[[.y]])) %>%
+  group_by(set) %>% mutate(p_BH = p.adjust(p, "BH")) %>% ungroup() %>% relocate(set)
+write_res(tests, "fig4_cohort_wilcoxon_tests.txt")
+tests %>% filter(set == "Unmatched") %>% mutate(across(where(is.numeric), ~ signif(.x, 3))) %>% knitr::kable()
+```
+
+# 4. Figure 4 assembled
+
+```{r fig4, fig.width=15, fig.height=15}
+n_top <- 1 + k_cl   # a + b + the clusters are 2 + k_cl panels: a and b on the first row, the clusters on the second
+row1 <- c(wrap_elements(full = p_5a), p_5b + theme(legend.position = "none"))
+row2 <- map(p_cl, ~ .x + theme(legend.position = "none"))
+p_top <- wrap_plots(row1, nrow = 1, widths = c(1, 1.2))
+p_mid <- wrap_plots(row2, nrow = 1)
+p_bot <- wrap_plots(stat_panels, nrow = 2)
+p_5 <- (p_top / p_mid / p_bot) + plot_layout(heights = c(1, 1, 1.5)) + plot_annotation(tag_levels = "a") & tag_theme
+save_main(p_5, 4, "Figure4", 15, 16, svg = TRUE)
+p_5
+```
+
+# 5. Supplementary figures
+
+## 5.1 The matching sets (the unmatched set is Figure 4a)
+
+```{r figS-sets, fig.width=15, fig.height=5}
+set_grobs <- map(sets[-1], ~ margin_plot(.x))
+for (i in seq_along(set_grobs)) for (e in c("png", "svg")) ggsave(file.path(paper$supp, "panels", paste0("FigS11_matching_sets_", letters[i], "_", names(sets)[-1][i], ".", e)), set_grobs[[i]], width = 5, height = 4.5, dpi = 300, bg = "white")
+p_sets <- wrap_plots(map(set_grobs, ~ wrap_elements(full = .x)), nrow = 1) + plot_annotation(tag_levels = "a") & tag_theme
+save_supp(p_sets, "FigS11_matching_sets", 15, 5)
+p_sets
+```
+
+## 5.2 Mixed models in the other sets, with the interaction, and by gene
+
+```{r figS-mm, fig.width=14, fig.height=5}
+strip_panel <- function(m, label) { m$data$panel <- label; cohort_model_panel(m) }
+p_s_sets_list <- map(set_keys[-1], ~ strip_panel(results[[paste0(.x, ".All.slope.zero")]], set_labels[[.x]]))
+for (i in seq_along(p_s_sets_list)) save_panel(p_s_sets_list[[i]], "supp", paste0("FigS12_mixed_models_sets_", letters[i]), 5, 5)
+p_s_sets <- wrap_plots(p_s_sets_list, nrow = 1) + plot_layout(guides = "collect") + plot_annotation(tag_levels = "a") & theme(legend.position = "bottom") & tag_theme
+save_supp(p_s_sets, "FigS12_mixed_models_sets", 14, 5)
+p_s_sets
+p_s_int_list <- map(set_keys, ~ strip_panel(results[[paste0(.x, ".All.slope.")]], set_labels[[.x]]))
+for (i in seq_along(p_s_int_list)) save_panel(p_s_int_list[[i]], "supp", paste0("FigS13_mixed_models_interaction_", letters[i]), 5, 5)
+p_s_int <- wrap_plots(p_s_int_list, nrow = 2) + plot_layout(guides = "collect") + plot_annotation(tag_levels = "a") & theme(legend.position = "bottom") & tag_theme
+save_supp(p_s_int, "FigS13_mixed_models_interaction", 12, 10)
+p_s_gene_list <- map(main_genes, ~ strip_panel(results[[paste0("unmatched.", .x, ".slope.zero")]], .x) + theme(strip.text = element_text(face = "italic")))
+for (i in seq_along(p_s_gene_list)) save_panel(p_s_gene_list[[i]], "supp", paste0("FigS14_mixed_models_by_gene_", letters[i], "_", main_genes[i]), 5, 5)
+p_s_gene <- wrap_plots(p_s_gene_list, nrow = 2) + plot_layout(guides = "collect") + plot_annotation(tag_levels = "a") & theme(legend.position = "bottom") & tag_theme
+save_supp(p_s_gene, "FigS14_mixed_models_by_gene", 14, 10)
+```
+
+```{r figS-mm-show, fig.width=14, fig.height=10}
+p_s_int; p_s_gene
+```
+
+## 5.3 Summary statistics in every set
+
+```{r figS-stats, fig.width=11, fig.height=13}
+set_figure <- function(s) {
+  rows <- map(stat_groups, function(st) wrap_plots(imap(st, ~ cohort_box(s, .y, .x, if (.y %in% names(hlines)) hlines[[.y]] else NULL, size = 12)), nrow = 1, ncol = 4))
+  wrap_plots(rows, ncol = 1) + plot_annotation(tag_levels = "a") & tag_theme
+}
+# Figures S15-S18, in the order of set_keys (unmatched, unmatched_filtered, matched, matched_filtered)
+for (i in seq_along(set_keys)) save_supp(set_figure(sums[[set_keys[i]]]), paste0("FigS", 14 + i, "_summary_statistics_", set_keys[i]), 11, 13)
+set_figure(sums$unmatched)
+```
+
+## 5.4 Sex and smoking (text only)
+
+From `results/paper/mixed_models_sex_smoking.txt` (`02_cohort_characteristics_sex_smoking.Rmd`).
+
+```{r sex}
+ss <- read_tsv_(file.path(rev$results, "mixed_models_sex_smoking.txt")) %>% filter(term == "CohortSHCS") %>%
+  mutate(cell = sprintf("%.2f (%.2f to %.2f), p = %s", estimate, conf.low, conf.high, fmt_p(p.value)))
+knitr::kable(ss %>% select(set, model, n_traj, cell))
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

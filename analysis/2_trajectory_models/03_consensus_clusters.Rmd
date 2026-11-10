@@ -1,0 +1,133 @@
+---
+title: "Number of trajectory clusters and the final consensus clusters (Table S6)"
+author: "Valeriia Timonina"
+date: "2026-11-06"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  k_final: 3
+  labels: "shrinking,stable,growing"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+The number of clusters of the consensus DTW clustering of the REML curves is chosen with the internal cluster validity
+indices of `dtwclust::cvi()` (median over the single runs of the consensus) and the proportion of ambiguous
+co-assignments (PAC) of the consensus (Methods). The chosen partition (`params$k_final` clusters, 100 seeds) is written to
+`results/paper/clusters_final.txt` with a label for each cluster, and the SardiNIA trajectories are assigned
+to it by the majority vote of the runs (`clusters_final_sardinia.txt`).
+
+```{r libraries}
+source("R/paper_functions.R")
+library(dtwclust)
+pred <- load_pred(); sum_ <- load_sum(); calls <- load_calls(); ages <- load_ages()
+sard_pred <- load_sard_pred() %>% mutate(Gene.refGene = Gene.refGene)
+series <- cluster_series(pred, "SHCS")
+k_final <- params$k_final
+```
+
+# 1. The number of clusters
+
+```{r scan}
+dm <- proxy::dist(series, method = "dtw_basic", window.size = 20L, norm = "L2")
+scan <- map_dfr(2:7, function(k) {
+  cc <- cluster_consensus(pred, seeds = 1:40, k = k)
+  cv <- sapply(cc$models, function(m) tryCatch(cvi(m, type = "internal"), error = function(e) rep(NA_real_, 7)))
+  tibble(k = k, PAC = cc$pac, `silhouette of the consensus (DTW)` = mean(cluster::silhouette(cc$clusters$cluster, dm)[, 3]),
+         sizes = paste(sort(table(cc$clusters$cluster), decreasing = TRUE), collapse = "/"),
+         as_tibble(as.list(apply(cv, 1, median, na.rm = TRUE))))
+})
+knitr::kable(scan, digits = 3, caption = "Indices by k: Sil, SF, CH, D to be maximised; DB, DBstar, COP and PAC to be minimised")
+write_res(scan, "clusters_k_scan.txt")
+best <- tibble(index = c("Sil", "SF", "CH", "D", "DB", "DBstar", "COP", "PAC"),
+               best_k = c(scan$k[which.max(scan$Sil)], scan$k[which.max(scan$SF)], scan$k[which.max(scan$CH)], scan$k[which.max(scan$D)],
+                          scan$k[which.min(scan$DB)], scan$k[which.min(scan$DBstar)], scan$k[which.min(scan$COP)], scan$k[which.min(scan$PAC)]))
+knitr::kable(best, caption = "The k preferred by each index")
+```
+
+# 2. The partitions for k = 2, 3 and 4
+
+```{r partitions, fig.width=14, fig.height=9}
+ref2 <- if (file.exists("results/clustering/SHCS_DTW_consensus_k2.txt")) load_clusters() else NULL   # optional: label order of an earlier two-cluster consensus
+cons <- map(2:4, ~ cluster_consensus(pred, seeds = 1:100, k = .x, ref = if (.x == 2) ref2 else NULL))
+names(cons) <- 2:4
+describe <- function(cl) {
+  sum_ %>% inner_join(cl %>% select(traj_id, cluster), by = "traj_id") %>%
+    left_join(calls %>% group_by(traj_id) %>% summarise(first_age = min(Age), .groups = "drop"), by = "traj_id") %>%
+    group_by(cluster) %>%
+    summarise(n = n(), `mean speed, median` = median(mean_VAF_speed), `mean acceleration, median` = median(mean_VAF_acceleration),
+              `max VAF, median` = median(max_VAF), `mean VAF, median` = median(mean_VAF), `age at LoD/2, median` = median(Age_LoD2, na.rm = TRUE),
+              `age at 2%, median` = median(Age_0.02, na.rm = TRUE), `crossed 2% during follow-up` = mean(!is.na(Age_0.02) & Age_0.02 > first_age + 0.25),
+              `first age, median` = median(min_Age), `growing (mean speed > 0)` = mean(mean_VAF_speed > eps_group), .groups = "drop")
+}
+for (k in 2:4) print(knitr::kable(describe(cons[[as.character(k)]]$clusters), digits = 4, caption = paste("k =", k)))
+p_k <- map(2:4, function(k) {
+  cl <- cons[[as.character(k)]]$clusters %>% mutate(label = paste("cluster", cluster))
+  cluster_curves_plot(pred, cl, size = 11) + labs(y = "VAF") + ggtitle(paste("k =", k))
+})
+wrap_plots(p_k, ncol = 1)
+```
+
+# 3. The final clusters
+
+Labels are given by the dynamics of each cluster, in the order of the median mean speed: the chosen k and the labels are
+the parameters of this notebook (`k_final`, `labels`), set after the inspection of section 2. With k = 3 the
+"not-growing" cluster of k = 2 splits into shrinking clones and stable clones, and the growing cluster is unchanged.
+
+```{r final}
+cc <- cons[[as.character(k_final)]]
+d <- describe(cc$clusters) %>% arrange(`mean speed, median`)
+# labels in the order of the median mean speed (params$labels, chosen after inspection of section 2); without them a rule:
+# median mean speed below -eps_group "shrinking", within eps_group "stable", above "growing"
+lab <- if (nzchar(params$labels)) trimws(strsplit(params$labels, ",")[[1]]) else
+  case_when(d$`mean speed, median` < -eps_group ~ "shrinking", d$`mean speed, median` <= 5 * eps_group ~ "stable", TRUE ~ "growing")
+stopifnot(length(lab) == nrow(d))
+d$label <- lab
+# renumber the clusters in the order of the median mean speed
+map_new <- setNames(seq_len(nrow(d)), d$cluster)
+final <- cc$clusters %>% mutate(cluster = as.integer(map_new[as.character(cluster)])) %>%
+  left_join(d %>% transmute(cluster = as.integer(map_new[as.character(cluster)]), label), by = "cluster") %>%
+  select(traj_id, cluster, label, confidence)
+knitr::kable(final %>% count(cluster, label))
+knitr::kable(describe(final) %>% left_join(final %>% distinct(cluster, label), by = "cluster"), digits = 4)
+write_res(final, "clusters_final.txt")
+write_res(as.data.frame(cc$M) %>% rownames_to_column("traj_id"), "clusters_final_coassignment.txt")
+# stability: another 100 seeds, and the leave-one-out test
+cc_rep <- cluster_consensus(pred, seeds = 101:200, k = k_final, ref = final)
+loo <- map_int(seq_along(series), function(i) {
+  cc_i <- consensus_series(series[-i], seeds = 1:30, k = k_final)
+  m <- relabel_map(cc_i$clusters$cluster, final$cluster[match(cc_i$clusters$traj_id, final$traj_id)], k_final)
+  pr <- consensus_predict(cc_i, series[i])
+  as.integer(m[pr$cluster] == final$cluster[final$traj_id == names(series)[i]])
+})
+stability <- tibble(k = k_final, PAC = cc$pac, `ARI with the consensus of 100 other seeds` = adjusted_rand(final$cluster, cc_rep$clusters$cluster),
+                    `leave-one-out: reassigned to its cluster` = sprintf("%d / %d", sum(loo), length(loo)),
+                    `single runs: median ARI with the consensus` = median(apply(cc$runs, 2, adjusted_rand, cc$clusters$cluster)))
+knitr::kable(stability, digits = 3)
+write_res(stability, "clusters_final_stability.txt")
+```
+
+# 4. SardiNIA trajectories assigned to the final clusters
+
+```{r sardinia}
+sard_assign <- assign_sardinia_consensus(cc, sard_pred) %>%
+  mutate(cluster = as.integer(map_new[as.character(cluster)])) %>%
+  left_join(final %>% distinct(cluster, label), by = "cluster")
+write_res(sard_assign, "clusters_final_sardinia.txt")
+shares <- bind_rows(final %>% mutate(Cohort = "SHCS"), sard_assign %>% mutate(Cohort = "SardiNIA")) %>%
+  count(Cohort, cluster, label) %>% group_by(Cohort) %>% mutate(share = n / sum(n)) %>% ungroup()
+knitr::kable(shares, digits = 3)
+write_res(shares, "clusters_final_shares.txt")
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

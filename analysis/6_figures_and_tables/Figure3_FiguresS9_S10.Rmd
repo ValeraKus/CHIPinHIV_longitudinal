@@ -1,0 +1,140 @@
+---
+title: "Figure 3 (blood parameters and CHIP dynamics on the measured timepoints), Figures S9 and S10"
+author: "Valeriia Timonina"
+date: "2026-11-05"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+Mixed models of the CHIP trajectory (log10 VAF, VAF speed, VAF acceleration of the REML curve of the largest clone of
+each person) on one blood parameter at a time, after ART start. The main analysis (Figure 3) uses the sequenced
+timepoints only (one row per measurement, random intercept per person), so that the outcome is a measured VAF and not an
+interpolated one. Sensitivity analysis: the same models on the half-year grid of the curves (random
+intercept and slope per trajectory). Gene- and cluster-specific models on the measured timepoints. All blood parameters are log10-transformed and age is standardised; the models are fitted
+by maximum likelihood (`lme4`). The platelet count is labelled PLT.
+
+```{r libraries}
+source("R/paper_functions.R")
+
+pred  <- load_pred()
+blood <- load_blood_grid()
+cl    <- load_final_clusters()
+k_cl  <- n_distinct(cl$cluster)
+d_grid <- blood_data(pred, blood)
+d_meas <- d_grid %>% filter(data_point == 1)
+cat("Grid rows after ART start:", nrow(d_grid), "in", n_distinct(d_grid$ID), "persons; measured timepoints:", nrow(d_meas), "in", n_distinct(d_meas$ID), "persons\n")
+knitr::kable(d_meas %>% summarise(across(all_of(blood_cols), ~ sum(!is.na(.x)))) %>% pivot_longer(everything(), names_to = "parameter", values_to = "measured timepoints with a value"))
+```
+
+# 1. The two versions of the models
+
+```{r models}
+versions <- list(
+  "sequenced timepoints" = list(d = d_meas, adjust = FALSE, measured = TRUE),
+  "half-year grid of the curves" = list(d = d_grid, adjust = FALSE, measured = FALSE))
+res <- imap_dfr(versions, function(v, name) blood_models(v$d, v$adjust, v$measured) %>% mutate(version = name)) %>%
+  mutate(version = factor(version, levels = names(versions)))
+write_res(res, "fig3_blood_models.txt")
+res %>% mutate(across(c(estimate, conf.low, conf.high), ~ signif(.x, 3)), p.value = signif(p.value, 2)) %>%
+  select(version, outcome, parameter, estimate, conf.low, conf.high, p.value, sig, n, n_persons) %>% knitr::kable()
+```
+
+# 2. Figure 3: measured timepoints
+
+```{r fig3, fig.width=11, fig.height=5.5}
+p_4 <- blood_forest(res %>% filter(version == "sequenced timepoints"), size = 16)
+save_main(p_4, 3, "Figure3", 11, 5.5)
+for (o in names(outcome_labels)) save_panel(blood_forest(res %>% filter(version == "sequenced timepoints"), size = 16, outcomes = o), 3, paste0("Fig3_", o), 4.5, 5.5)
+p_4
+```
+
+# 3. The two versions side by side
+
+```{r figS-versions, fig.width=12, fig.height=8}
+version_colors <- c("deepskyblue2", "#c9730a")
+p_sv <- res %>%
+  mutate(parameter = factor(parameter, levels = rev(blood_cols), labels = rev(blood_labels[blood_cols])),
+         outcome = factor(outcome, levels = names(outcome_labels), labels = outcome_labels)) %>%
+  ggplot(aes(y = parameter, x = estimate, xmin = conf.low, xmax = conf.high, colour = version)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(position = position_dodge(width = 0.7), size = 0.3) +
+  facet_wrap(~outcome, scales = "free_x") +
+  scale_colour_manual(values = version_colors) +
+  labs(x = "Estimate (95% CI) of the blood parameter (log10)", y = NULL, colour = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom", strip.background = element_rect(linewidth = 0.6))
+save_extra(p_sv, "blood_models_timepoints_vs_grid", 12, 7)   # not a display item of the paper
+p_sv
+```
+
+A comparison of the estimates of the main version with an earlier version of the analysis
+(`results/paper/blood_models_versions.txt`, not part of this repository); it runs only if that file is present:
+
+```{r compare-submitted, eval = file.exists(file.path(rev$results, "blood_models_versions.txt"))}
+old <- read_tsv_(file.path(rev$results, "blood_models_versions.txt")) %>% filter(grepl("^1\\.", version)) %>%
+  select(outcome, parameter, submitted = estimate, p_submitted = p.value)
+cmp <- res %>% filter(version == "sequenced timepoints") %>% select(outcome, parameter, measured = estimate, p_measured = p.value) %>%
+  inner_join(old, by = c("outcome", "parameter")) %>%
+  mutate(across(c(measured, submitted), ~ signif(.x, 2)), across(c(p_measured, p_submitted), ~ signif(.x, 2)))
+knitr::kable(cmp)
+```
+
+# 4. Gene-specific and cluster-specific models on the measured timepoints
+
+Genes with at least 8 persons; the cluster of the person's largest trajectory.
+
+```{r by-gene-cluster}
+gene_n <- d_meas %>% distinct(ID, Gene = as.character(group_genes(Gene.refGene))) %>% count(Gene)
+knitr::kable(gene_n)
+genes_used <- intersect(c("DNMT3A", "TET2", "ASXL1", "PPM1D", "TP53"), gene_n$Gene[gene_n$n >= 8])   # paper gene order
+res_gene <- map_dfr(genes_used, function(g) blood_models(d_meas %>% filter(as.character(group_genes(Gene.refGene)) == g), FALSE, TRUE) %>% mutate(group = g))
+lab_map <- cluster_label_map(cl)
+res_cl <- map_dfr(seq_len(k_cl), function(k) {
+  ids_k <- cl$traj_id[cl$cluster == k]
+  d_k <- d_meas %>% filter(traj_id %in% ids_k)
+  if (n_distinct(d_k$ID) < 8) return(NULL)
+  blood_models(d_k, FALSE, TRUE) %>% mutate(group = paste0("\"", lab_map[[as.character(k)]], "\" cluster (", n_distinct(d_k$ID), " persons)"))
+})
+knitr::kable(d_meas %>% inner_join(cl %>% select(traj_id, cluster, label), by = "traj_id") %>% distinct(ID, cluster, label) %>% count(cluster, label), caption = "Persons by the cluster of their largest clone")
+write_res(bind_rows(res_gene %>% mutate(level = "gene"), res_cl %>% mutate(level = "cluster")), "fig3_blood_models_by_gene_cluster.txt")
+```
+
+```{r figS-gene, fig.width=11, fig.height=4 * length(genes_used)}
+gene_panel <- function(g) blood_forest(res_gene %>% filter(group == g), size = 14) + facet_grid(. ~ outcome, scales = "free_x") +
+  theme(strip.text = element_text(size = 13))
+p_sg <- wrap_plots(map(genes_used, gene_panel), ncol = 1) + plot_annotation(tag_levels = "a") & tag_theme
+for (i in seq_along(genes_used)) save_panel(gene_panel(genes_used[i]), "supp", paste0("FigS9_blood_models_by_gene_", letters[i], "_", genes_used[i]), 11, 4)
+save_supp(p_sg, "FigS9_blood_models_by_gene", 11, 4 * length(genes_used))
+p_sg
+```
+
+```{r figS-cluster, fig.width=11, fig.height=8}
+cl_groups <- unique(res_cl$group)
+cl_panel <- function(g) blood_forest(res_cl %>% filter(group == g), size = 14)
+p_sc <- wrap_plots(map(cl_groups, cl_panel), ncol = 1) + plot_annotation(tag_levels = "a") & tag_theme
+for (i in seq_along(cl_groups)) save_panel(cl_panel(cl_groups[i]), "supp", paste0("FigS10_blood_models_by_cluster_", letters[i]), 11, 4)
+save_supp(p_sc, "FigS10_blood_models_by_cluster", 11, 4 * length(cl_groups))
+cat("Cluster panels, in order:", paste(cl_groups, collapse = "; "), "\n")
+p_sc
+```
+
+# 5. Collinearity of the blood parameters at the measured timepoints
+
+```{r collinearity}
+cm <- cor(d_meas %>% select(all_of(blood_cols)) %>% mutate(across(everything(), ~ log10(.x + 1e-4))), use = "pairwise.complete.obs", method = "spearman")
+knitr::kable(round(cm, 2))
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

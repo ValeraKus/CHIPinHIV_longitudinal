@@ -1,0 +1,190 @@
+---
+title: "Figure S6 (co-occurring CHIP trajectories) and the pair table (Table S5)"
+author: "Valeriia Timonina"
+date: "2026-11-05"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+All individuals with more than one CHIP trajectory are analysed together (with the
+participant ids of the paper): for every pair of trajectories of
+an individual, the Spearman correlation of the two REML curves and of their speeds over the ages both cover, the
+correlation of the measured VAFs at shared timepoints, the net direction of each curve, the read-noise test of the
+measured VAFs and the pigeonhole bound (2 VAF1 + 2 VAF2 > 1 forces the variants into the same cells). A figure of
+three individuals for each of the three patterns is drawn but is not a display item of the paper; Figure S6 shows all individuals.
+
+```{r libraries}
+source("R/paper_functions.R")
+library(ggrepel)
+
+calls <- load_calls()
+pred  <- load_pred()
+cl    <- load_final_clusters()
+multi <- calls %>% group_by(ID) %>% filter(n_distinct(traj_id) > 1) %>% ungroup()
+ids <- multi %>% distinct(ID, SHCS_ID_new) %>% mutate(num = as.integer(sub("SHCS_", "", SHCS_ID_new))) %>% arrange(num)
+pred_m <- pred %>% filter(traj_id %in% multi$traj_id) %>% inner_join(calls %>% distinct(traj_id, label), by = "traj_id")
+cat(nrow(ids), "individuals with more than one trajectory;", n_distinct(multi$traj_id), "trajectories\n")
+knitr::kable(multi %>% distinct(SHCS_ID_new, traj_id, Gene.refGene) %>% count(SHCS_ID_new, name = "trajectories") %>% arrange(as.integer(sub("SHCS_", "", SHCS_ID_new))))
+```
+
+# 1. Pairwise analysis
+
+```{r pairs}
+net_direction <- function(v) {
+  d <- tail(v, 1) - head(v, 1)
+  rng <- max(v) - min(v)
+  if (rng < 0.01) return("flat") else if (d > 0.3 * rng) "up" else if (d < -0.3 * rng) "down" else "flat"
+}
+first_detect <- function(tid) min(multi$Age[multi$traj_id == tid & multi$source != "imputed"])
+
+pair_rows <- list()
+for (id in ids$ID) {
+  tr <- unique(multi$traj_id[multi$ID == id])
+  for (i in seq_along(tr)) for (j in seq_along(tr)) if (i < j) {
+    a <- pred_m %>% filter(traj_id == tr[i]) %>% select(Age, VAF, VAF_speed)
+    b <- pred_m %>% filter(traj_id == tr[j]) %>% select(Age, VAF, VAF_speed)
+    ab <- inner_join(a, b, by = "Age", suffix = c("1", "2"))
+    oa <- multi %>% filter(traj_id == tr[i]) %>% select(Age, AF, source, lod_depth)
+    ob <- multi %>% filter(traj_id == tr[j]) %>% select(Age, AF, source, lod_depth)
+    oab <- inner_join(oa, ob, by = "Age", suffix = c("1", "2")) %>%
+      mutate(se = sqrt(AF1 * (1 - AF1) / lod_depth1 + AF2 * (1 - AF2) / lod_depth2), z = (AF1 - AF2) / se)
+    r_vaf <- if (nrow(ab) > 2) suppressWarnings(cor(ab$VAF1, ab$VAF2, method = "spearman")) else NA
+    r_speed <- if (nrow(ab) > 2) suppressWarnings(cor(ab$VAF_speed1, ab$VAF_speed2, method = "spearman")) else NA
+    r_obs <- if (nrow(oab) > 2) suppressWarnings(cor(oab$AF1, oab$AF2, method = "spearman")) else NA
+    pair_rows[[length(pair_rows) + 1]] <- tibble(
+      ID = id, traj_1 = tr[i], traj_2 = tr[j],
+      variant_1 = calls$label[match(tr[i], calls$traj_id)], variant_2 = calls$label[match(tr[j], calls$traj_id)],
+      shared_ages = sprintf("%g-%g", min(ab$Age), max(ab$Age)), n_shared_timepoints = nrow(oab),
+      r_curves = r_vaf, r_speed = r_speed, r_measured = r_obs,
+      direction_1 = net_direction(ab$VAF1), direction_2 = net_direction(ab$VAF2),
+      max_VAF_1 = max(oab$AF1), max_VAF_2 = max(oab$AF2),
+      max_cell_fraction_sum = max(2 * oab$AF1 + 2 * oab$AF2), must_overlap = max(2 * oab$AF1 + 2 * oab$AF2) > 1,
+      max_abs_z = max(abs(oab$z)), within_read_noise = all(abs(oab$z) < 2),
+      first_detection_gap_years = abs(first_detect(tr[i]) - first_detect(tr[j])),
+      cluster_1 = cl$cluster[match(tr[i], cl$traj_id)], cluster_2 = cl$cluster[match(tr[j], cl$traj_id)])
+  }
+}
+pairs <- bind_rows(pair_rows) %>%
+  inner_join(ids %>% select(ID, SHCS_ID_new), by = "ID") %>%
+  mutate(size_ratio = pmin(max_VAF_1, max_VAF_2) / pmax(max_VAF_1, max_VAF_2),
+         parallel = !is.na(r_curves) & r_curves >= 0.5 & !is.na(r_speed) & r_speed >= 0.3 & direction_1 == direction_2 & direction_1 != "flat",
+         divergent = (!is.na(r_curves) & r_curves <= -0.5 | !is.na(r_speed) & r_speed <= -0.3) & direction_1 != direction_2 & direction_1 != "flat" & direction_2 != "flat",
+         call = case_when(
+           parallel & size_ratio >= 0.5 ~ "parallel, similar size (putative co-clonal)",
+           parallel & size_ratio < 0.5 ~ "parallel, nested sizes (putative subclone or co-expanding)",
+           divergent ~ "divergent (putative competing)",
+           first_detection_gap_years >= 5 & !is.na(r_curves) & r_curves >= 0.5 ~ "sequential (second variant appears later)",
+           TRUE ~ "unclear")) %>%
+  select(-parallel, -divergent) %>%
+  relocate(SHCS_ID_new) %>%
+  arrange(as.integer(sub("SHCS_", "", SHCS_ID_new)), variant_1, variant_2)
+knitr::kable(pairs %>% select(-ID, -traj_1, -traj_2) %>% mutate(across(where(is.numeric), ~ round(.x, 2))))
+table(pairs$call)
+cat("\nPairs in which the two variants must share cells (2 VAF1 + 2 VAF2 > 1 at a timepoint):", sum(pairs$must_overlap),
+    "\nPairs with measured VAFs within read noise at every shared timepoint:", sum(pairs$within_read_noise), "\n")
+tableS5 <- pairs %>%
+  transmute(Participant = SHCS_ID_new, `Variant 1` = variant_1, `Variant 2` = variant_2, `Shared ages` = shared_ages,
+            `Shared timepoints` = n_shared_timepoints, `r curves` = round(r_curves, 2), `r speed` = round(r_speed, 2), `r measured VAF` = round(r_measured, 2),
+            `Direction 1 / 2` = paste(direction_1, direction_2, sep = " / "), `Max VAF 1 / 2 (%)` = sprintf("%.1f / %.1f", 100 * max_VAF_1, 100 * max_VAF_2),
+            `Max |z|` = round(max_abs_z, 1), `Within read noise` = ifelse(within_read_noise, "yes", "no"),
+            `Max sum of cell fractions` = round(max_cell_fraction_sum, 2), `Gap of first detection, years` = first_detection_gap_years,
+            `Cluster 1 / 2` = paste(cluster_label_map(cl)[as.character(cluster_1)], cluster_label_map(cl)[as.character(cluster_2)], sep = " / "), Call = call)
+write_res(tableS5, "tableS_cooccurring_pairs.txt", paper_copy = TRUE)
+write_res(pairs, "figS6_pairs_full.txt")
+```
+
+# 2. Three individuals per pattern (not a display item of the paper)
+
+Colours are the genes of the paper; the protein change is written at the end of each curve. Points: measured VAF
+(filled circle: Mutect2 call; triangle: variant reads in the pile-up; open circle: not detected, LoD / 2). Dashed line: 2%.
+
+```{r examples, fig.width=13, fig.height=10}
+used <- c()
+pick <- function(pattern, n = 3) {
+  cand <- pairs %>% filter(grepl(pattern, call), !ID %in% used) %>% arrange(desc(abs(r_curves)), desc(n_shared_timepoints)) %>% distinct(ID) %>% head(n) %>% pull(ID)
+  used <<- c(used, cand)
+  cand
+}
+patterns <- c("parallel, similar size (putative co-clonal variants)", "divergent (putative competing clones)", "nested or sequential (putative subclone or later variant)")
+# the divergent pattern is picked first because its individuals also carry parallel pairs
+ex <- bind_rows(tibble(ID = pick("divergent"), pattern = patterns[2]),
+                tibble(ID = pick("similar size"), pattern = patterns[1]),
+                tibble(ID = pick("nested|sequential"), pattern = patterns[3])) %>%
+  inner_join(ids %>% select(ID, SHCS_ID_new), by = "ID") %>%
+  mutate(pattern = factor(pattern, levels = patterns))
+knitr::kable(ex)
+
+panel_of <- function(d) d %>% inner_join(ex, by = c("ID", "SHCS_ID_new")) %>%
+  mutate(Gene = factor(as.character(group_genes(Gene.refGene)), levels = gene_levels), Gene = fct_recode(Gene),
+         gene_colour = ifelse(Gene.refGene %in% names(gene_colors), Gene.refGene, "Other"))
+pm <- panel_of(pred_m)
+om <- panel_of(multi)
+ends <- pm %>% group_by(traj_id) %>% filter(Age == max(Age)) %>% ungroup() %>% mutate(change = sub("^[A-Z0-9]+ ", "", label))
+genes_in_fig <- names(gene_colors)[names(gene_colors) %in% unique(pm$gene_colour)]   # one legend for the three rows
+fig3_pattern <- function(pat) {
+  ggplot() +
+    geom_line(data = filter(pm, pattern == pat), aes(x = Age, y = VAF, group = traj_id, colour = gene_colour), linewidth = 1.2, show.legend = TRUE) +
+    geom_point(data = filter(om, pattern == pat), aes(x = Age, y = AF, colour = gene_colour), size = 2.3, show.legend = TRUE) +
+    geom_text_repel(data = filter(ends, pattern == pat), aes(x = Age, y = VAF, label = change, colour = gene_colour), size = 3,
+                    direction = "y", hjust = 0, nudge_x = 1.2, segment.size = 0.2, show.legend = FALSE, min.segment.length = 0) +
+    geom_hline(yintercept = chip_vaf, linetype = "dashed", linewidth = 0.5) +
+    facet_wrap(~SHCS_ID_new, scales = "free", nrow = 1) +
+    scale_colour_manual(values = gene_colors, name = "CHIP gene", breaks = genes_in_fig, limits = genes_in_fig) +
+    scale_y_continuous(labels = percent) +
+    scale_x_continuous(expand = expansion(mult = c(0.05, 0.3))) +
+    labs(x = "Age", y = "VAF (clone size)") +
+    theme_classic(base_size = 13) +
+    theme(strip.background = element_blank(), strip.text = element_text(size = 13), legend.position = "bottom") +
+    guides(colour = guide_legend(nrow = 1, override.aes = list(linewidth = 1.2, size = 2.3)))
+}
+p_rows <- map(patterns, fig3_pattern)
+# three examples of the patterns (Figure S6 shows all individuals)
+p_3 <- wrap_plots(p_rows, ncol = 1) + plot_layout(guides = "collect") + plot_annotation(tag_levels = "a") &
+  theme(legend.position = "bottom") & tag_theme
+save_extra(p_3, "cooccurring_examples", 13, 11)   # not a display item of the paper
+p_3
+```
+
+# 3. Figure S6: all individuals with several trajectories
+
+```{r figS-all, fig.width=14, fig.height=12}
+pa <- pred_m %>% mutate(SHCS_ID_new = factor(SHCS_ID_new, levels = ids$SHCS_ID_new), gene_colour = ifelse(Gene.refGene %in% names(gene_colors), Gene.refGene, "Other"))
+oa <- multi %>% mutate(SHCS_ID_new = factor(SHCS_ID_new, levels = ids$SHCS_ID_new), gene_colour = ifelse(Gene.refGene %in% names(gene_colors), Gene.refGene, "Other"))
+ea <- pa %>% group_by(traj_id) %>% filter(Age == max(Age)) %>% ungroup() %>% mutate(change = sub("^[A-Z0-9]+ ", "", label))
+p_all <- ggplot() +
+  geom_line(data = pa, aes(x = Age, y = VAF, group = traj_id, colour = gene_colour), linewidth = 1) +
+  geom_point(data = oa, aes(x = Age, y = AF, colour = gene_colour), size = 2) +
+  geom_text_repel(data = ea, aes(x = Age, y = VAF, label = change, colour = gene_colour), size = 2.7, direction = "y", hjust = 0, nudge_x = 1,
+                  segment.size = 0.2, show.legend = FALSE, min.segment.length = 0) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed", linewidth = 0.4) +
+  facet_wrap(~SHCS_ID_new, scales = "free", ncol = 4) +
+  scale_colour_manual(values = gene_colors, name = "CHIP gene", breaks = names(gene_colors)[names(gene_colors) %in% c(gene_levels, other_genes)]) +
+  scale_y_continuous(labels = percent) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.3))) +
+  labs(x = "Age", y = "VAF") +
+  theme_classic(base_size = 12) +
+  theme(strip.background = element_blank(), legend.position = "bottom")
+save_supp(p_all, "FigS6_cooccurring_all_individuals", 14, 12)
+p_all
+```
+
+# 4. Summary
+
+```{r summary}
+pairs %>% count(call) %>% mutate(share = sprintf("%.0f%%", 100 * n / sum(n))) %>% knitr::kable()
+pairs %>% filter(within_read_noise) %>% select(SHCS_ID_new, variant_1, variant_2, max_abs_z, call) %>% knitr::kable(digits = 2)
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

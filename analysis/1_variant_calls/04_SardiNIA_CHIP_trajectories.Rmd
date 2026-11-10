@@ -1,0 +1,843 @@
+---
+title: "CHIP SardiNIA longitudinal data: LoD and trajectory filtering"
+author: "Valeriia Timonina"
+date: "2026-11-03"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+params:
+  cross_sectional: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 5)
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+library(ggpubr)
+library(scales)
+```
+
+```{r paths}
+# cross_sectional = TRUE: the SHCS trajectories with the cross-sectional calls, read from and written to their own folders
+lod_sub <- if (params$cross_sectional) "LoD/cross_sectional" else "LoD"
+resources_lod <- file.path("resources", lod_sub)
+results_lod   <- file.path("results", lod_sub)
+figures_lod   <- file.path("figures", lod_sub)
+for (d in c(resources_lod, results_lod, figures_lod)) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+shcs_calls_file <- if (params$cross_sectional) file.path(resources_lod, "chip_calls_long_filtered.txt") else "resources/chip_calls_long_filtered.txt"
+```
+
+`r if (params$cross_sectional) "**Sensitivity analysis: this run uses the SHCS trajectories that include the cross-sectional calls.** The paths named in the text are those of the main analysis; this run reads and writes the folders cross_sectional under them."`
+
+
+```{r colors}
+source("R/Set_colors.R")
+```
+
+The SardiNIA trajectories (Fabre et
+al., *Nature* 2022) are selected with the criteria of the SHCS trajectories
+(`02_SHCS_CHIP_trajectories.Rmd`), with the same limit of detection (LoD)
+from the `chip_lod` package. The timepoints at which a variant is not detected get half the LoD of the timepoint.
+
+The SardiNIA trajectories are then fitted together with the SHCS trajectories (`2_trajectory_models/01_spline_fits.Rmd`,
+`02_ages_at_LoD2_and_2pct.Rmd`) and matched to them (`5_cohort_comparison/01_SHCS_SardiNIA_matching.Rmd`); these
+notebooks write to `resources/LoD/`, `results/LoD/` and `figures/LoD/`.
+
+**Parameter `cross_sectional`.** A sensitivity analysis with the calls of the earlier cross-sectional screening added
+to the SHCS trajectories. It needs a table of these trajectories that is not part of this repository;
+keep the default `FALSE`.
+
+**How the SHCS steps translate to SardiNIA.** `ALLvariants_exclSynonymous_Xadj.txt` has one row per variant and phase
+with the read counts at the variant, so there is one kind of measurement and no separate pileup:
+
+| SHCS (section of the SHCS notebook) | SardiNIA (section here) |
+|---|---|
+| Individuals with a single sample, individuals without a CHIP call (1) | Individuals with no variant in the table (1) |
+| Samples with DNA from another person (1) | **Not applied:** the check needs reads at non-CHIP sites, which are not available |
+| Mutect2 and bam-readcount timepoints (3, 6) | Read counts of the table: detected = at least `min_alt_reads` read of the variant allele (3) |
+| Cross-sectional screening (4) | None |
+| >= 1 call with VAF >= 2% and >= `min_tp_above_lod` calls with VAF >= LoD (5) | The same, on the detected timepoints (4) |
+| >= 2 detected timepoints, >= 1 of them with VAF >= 2% (7) | The same (5) |
+| LoD per trajectory; not detected timepoints at LoD / 2; runs shortened (8) | The same (6) |
+| Not needed: every SHCS trajectory has >= 3 timepoints | >= 3 timepoints in the final trajectory, the spline needs them (6.3) |
+
+Two restrictions are not part of the SHCS criteria but make the cohorts comparable:
+the genes of the SHCS trajectories, and no timepoint above the oldest age in SHCS (`max_age`).
+
+
+# Parameters
+
+```{r parameters}
+chip_vaf <- 0.02    # CHIP VAF threshold
+max_age  <- 89      # trajectories with a timepoint above this age are removed (oldest age in SHCS, checked in section 1.1)
+
+# chip_lod: the same values as 02_SHCS_CHIP_trajectories.Rmd
+err_rate  <- 0.001  # per-base sequencing error rate e
+alpha     <- 0.05   # per-site false-positive rate used for k*
+power_tgt <- 0.95   # detection probability that defines the LoD
+
+min_tp_above_lod <- 1    # section 4: timepoints with VAF >= LoD a trajectory needs (1 or 2)
+min_alt_reads    <- 1    # section 3: reads of the variant allele that make a timepoint detected
+min_timepoints   <- 2    # section 5: detected timepoints a trajectory needs
+impute_fraction  <- 0.5  # section 6: VAF of a not detected timepoint = impute_fraction x LoD of the timepoint
+min_spline_tp    <- 3    # section 6.3: timepoints of the final trajectory (the spline cannot be fitted to fewer)
+
+status_levels <- c("VAF >= LoD", "called, VAF < LoD", "not called (k < k*)")
+status_colors <- setNames(c("#2a78d6", "#E69F00", "#898781"), status_levels)
+shape_final   <- c("read counts" = 16, "imputed" = 1)
+
+med_iqr <- function(x, digits = 0, scale = 1) {
+  if (all(is.na(x))) return("-")
+  q <- quantile(x * scale, c(0.5, 0.25, 0.75), na.rm = TRUE)
+  sprintf("%.*f (%.*f-%.*f)", digits, q[1], digits, q[2], digits, q[3])
+}
+n_pct <- function(x) sprintf("%d (%.1f%%)", sum(x), 100 * mean(x))
+```
+
+`record_step()` reports the counts left after a step (and keeps them for section 7), `plot_traj()` draws the trajectories
+of a table.
+
+```{r helpers}
+step_counts <- tibble()
+
+# obs: one row per trajectory and timepoint, `detected` marks a measured VAF above 0
+record_step <- function(step, obs) {
+  row <- obs %>%
+    summarise(individuals = n_distinct(ID),
+              `samples (timepoints)` = n_distinct(Sample),
+              `samples with a detected variant` = n_distinct(Sample[detected]),
+              trajectories = n_distinct(traj_id),
+              `detected timepoints` = sum(detected),
+              `not detected timepoints` = sum(!detected)) %>%
+    mutate(step = step, .before = 1)
+  step_counts <<- bind_rows(step_counts, row)
+  knitr::kable(row)
+}
+
+plot_traj <- function(df, shape_by, shapes, title = NULL, y_log = FALSE, facet = "Gene.refGene", ncol = NULL) {
+  p <- ggplot(df, aes(x = Age_exact, y = AF_plot, color = Gene.refGene, group = traj_id)) +
+    geom_line(linewidth = 0.4) +
+    geom_point(aes(shape = .data[[shape_by]]), size = 1.2) +
+    geom_hline(yintercept = chip_vaf, linewidth = 0.4, linetype = "dashed") +
+    scale_color_manual(values = gene_colors) +
+    scale_shape_manual(values = shapes) +
+    facet_wrap(as.formula(paste("~", facet)), ncol = ncol) +
+    labs(x = "Age", y = "VAF", color = "CHIP gene", shape = NULL, title = title) +
+    theme_classic()
+  if (y_log) p <- p + scale_y_log10(labels = percent)
+  p
+}
+```
+
+
+# 1. Data
+
+## 1.1 Variants and individuals
+
+Rows without a variant are removed (individuals or phases in which nothing was called). The genes are those of the final
+SHCS trajectories; a trajectory (one variant in one individual) is removed as a whole if one of its timepoints is above
+`max_age` = `r max_age`.
+
+```{r data}
+fabre_raw <- read.table("resources/SardiNIA/ALLvariants_exclSynonymous_Xadj.txt", sep = "\t", header = TRUE)
+shcs      <- read.table(shcs_calls_file, sep = "\t", header = TRUE)
+
+chip_genes <- sort(unique(shcs$Gene.refGene))
+stopifnot(max(shcs$Age) == max_age)
+chip_genes
+
+fabre_all <- fabre_raw %>%
+  filter(!is.na(TOTALcount)) %>%
+  mutate(ID = paste0("Sard_", SardID), Sample = paste(ID, Phase, sep = "_"))
+
+c(rows_in_file = nrow(fabre_raw), rows_with_a_variant = nrow(fabre_all), individuals_in_file = n_distinct(fabre_raw$SardID),
+  individuals_with_a_variant = n_distinct(fabre_all$ID))
+```
+
+**Transcript of interest.** As in SHCS, the trajectory is named after the annotation on the accession listed in
+`CHIP_candidate_variants.csv`. Entries are separated by `,` (`AAChange.refGene`) or `;` (splice sites). Where no entry is on
+a listed accession, the first entry is used.
+
+```{r transcript}
+chip_crit <- read.csv("resources/CHIP_screening/CHIP_candidate_variants.csv", fileEncoding = "UTF-8-BOM")
+accession_pattern <- paste(chip_crit$Accession, collapse = "|")
+
+transcript_of <- function(x) {
+  entries <- strsplit(x, "[,;]")[[1]]
+  hits <- grep(accession_pattern, entries, value = TRUE)
+  if (length(hits) > 0) hits[1] else entries[1]
+}
+
+fabre <- fabre_all %>%
+  filter(Gene %in% chip_genes) %>%
+  mutate(Variant = map_chr(AAChange.refGene, transcript_of),
+         traj_id = paste(ID, Variant, sep = ":"))
+
+# one genomic variant per trajectory, one row per trajectory and phase
+stopifnot(!anyDuplicated(distinct(fabre, traj_id, CHR, START, REF, ALT)$traj_id),
+          !anyDuplicated(fabre[c("traj_id", "Phase")]))
+
+fabre %>%
+  group_by(traj_id) %>%
+  summarise(ID = first(ID), older = max(Age) > max_age, .groups = "drop") %>%
+  group_by(group = ifelse(older, paste("removed: timepoint above age", max_age), "kept")) %>%
+  summarise(trajectories = n(), individuals = n_distinct(ID)) %>%
+  knitr::kable(caption = "Trajectories in the genes of SHCS")
+```
+
+**Read counts and age.** `MUTcount_Xadj` is halved for X-linked variants in men. The LoD is a statement about raw reads, so
+the variant reads are `TOTALcount - WTcount`, as in `01_per_sample_LoD_and_QC.Rmd` (section 8). None of the genes of SHCS is on
+chromosome X, so here they equal `MUTcount_Xadj`. `VAF` is 0 exactly where there is no read of the variant. Age is kept to
+the year in `Age` (the spline predicts on a grid of `step` years, as in SHCS, where age is a difference of years) and exact
+in `Age_exact`.
+
+```{r reads}
+fabre <- fabre %>%
+  mutate(n = TOTALcount, k = TOTALcount - WTcount, Age_exact = Age, Age = round(Age_exact), AF = VAF,
+         Gene.refGene = Gene, Chr = CHR, Start = START, End = END, Ref = REF, Alt = ALT) %>%
+  group_by(traj_id) %>%
+  filter(max(Age_exact) <= max_age) %>%
+  ungroup() %>%
+  arrange(ID, traj_id, Age_exact)
+
+stopifnot(all(fabre$k == fabre$MUTcount_Xadj), all((fabre$AF == 0) == (fabre$k == 0)),
+          !anyDuplicated(fabre[c("traj_id", "Age")]))
+
+n_missing_phase <- fabre %>%
+  distinct(traj_id, ID) %>%
+  inner_join(distinct(fabre_raw %>% mutate(ID = paste0("Sard_", SardID)), ID, Phase), by = "ID", relationship = "many-to-many") %>%
+  anti_join(fabre, by = c("traj_id", "Phase")) %>%
+  nrow()
+```
+
+`r n_missing_phase` phase(s) of an individual have no row for one of its variants, so there is no read count, and no
+timepoint, at this phase.
+
+
+# 2. LoD of all timepoints
+
+For a site with depth `n` and `k` reads of the variant allele, `lod_frequentist()` of
+[`chip_lod`](https://github.com/adriaan-vd-graaf/chip_lod) (in `external/chip_lod`) returns:
+
+| column | meaning |
+|---|---|
+| `k_star` | smallest read count with P(K >= k) <= `alpha` under sequencing error alone (Poisson, `n * e / 3`) |
+| `called` | `k >= k_star` |
+| `lod_vaf` | smallest true VAF that reaches `k_star` reads with probability >= `power_target` at this depth |
+
+`k_star` and `lod_vaf` depend only on depth, so unlike the SHCS timepoints each timepoint here has a measured depth and its
+own LoD. The error rate of SardiNIA is known only to be below about three times the value used.
+
+```{r chip-lod}
+chip_lod <- new.env()
+for (f in c("model.R", "lod.R")) {
+  sys.source(file.path("external/chip_lod", "r", "R", f), envir = chip_lod)
+}
+lod_frequentist <- chip_lod$lod_frequentist
+
+add_lod <- function(df) {
+  pairs <- df %>% distinct(n, k) %>% mutate(n = as.integer(n), k = as.integer(k))
+  lod_tab <- lod_frequentist(n = pairs$n, k = pairs$k, e = err_rate, alpha = alpha, power_target = power_tgt) %>%
+    select(n, k, k_star, called, lod_vaf)
+  df %>%
+    left_join(lod_tab, by = c("n", "k")) %>%
+    mutate(vaf_reads  = k / n,
+           lod_status = case_when(is.na(lod_vaf)      ~ NA_character_,
+                                  !called             ~ "not called (k < k*)",
+                                  vaf_reads < lod_vaf ~ "called, VAF < LoD",
+                                  TRUE                ~ "VAF >= LoD"),
+           lod_status = factor(lod_status, levels = status_levels))
+}
+
+fabre <- add_lod(fabre)
+stopifnot(!anyNA(fabre$lod_vaf))
+```
+
+**Summary of all timepoints** of the trajectories of section 1:
+
+```{r lod-summary}
+fabre %>%
+  summarise(timepoints = n(), individuals = n_distinct(ID), trajectories = n_distinct(traj_id),
+            `reads of the variant >= 1` = n_pct(k >= 1),
+            `VAF >= LoD` = n_pct(lod_status == "VAF >= LoD"),
+            `VAF >= 2%` = n_pct(AF >= chip_vaf),
+            `VAF >= LoD and >= 2%` = n_pct(lod_status == "VAF >= LoD" & AF >= chip_vaf)) %>%
+  knitr::kable()
+
+fabre %>%
+  summarise(`depth, median (IQR)` = med_iqr(n),
+            `depth, range` = paste(range(n), collapse = "-"),
+            `k*, range` = paste(range(k_star), collapse = "-"),
+            `LoD VAF %, median (IQR)` = med_iqr(lod_vaf, 2, 100),
+            `LoD VAF %, range` = paste(round(100 * range(lod_vaf), 2), collapse = "-"),
+            `VAF %, median (IQR)` = med_iqr(AF, 2, 100)) %>%
+  knitr::kable()
+
+fabre %>%
+  count(lod_status, `VAF >= 2%` = ifelse(AF >= chip_vaf, "VAF >= 2%", "VAF < 2%")) %>%
+  pivot_wider(names_from = `VAF >= 2%`, values_from = n, values_fill = 0) %>%
+  mutate(total = rowSums(across(where(is.numeric)))) %>%
+  knitr::kable(caption = "Timepoints by LoD status and VAF")
+```
+
+By gene:
+
+```{r lod-gene}
+fabre %>%
+  group_by(Gene.refGene) %>%
+  summarise(timepoints = n(), trajectories = n_distinct(traj_id),
+            `VAF >= LoD` = n_pct(lod_status == "VAF >= LoD"),
+            `VAF >= 2%` = n_pct(AF >= chip_vaf),
+            `LoD VAF %, median` = round(100 * median(lod_vaf), 2)) %>%
+  arrange(-timepoints) %>%
+  knitr::kable()
+```
+
+Each point is one timepoint; line: LoD at each depth, dashed line: 2%. The y axis is pseudo-logarithmic, so that the
+timepoints without a read of the variant show on the x axis.
+
+```{r lod-plot, fig.height=4.5}
+ggplot(fabre, aes(x = n, y = vaf_reads)) +
+  geom_line(data = fabre %>% distinct(n, lod_vaf), aes(y = lod_vaf), linewidth = 0.4) +
+  geom_point(aes(colour = lod_status), size = 1, alpha = 0.7) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+  scale_x_log10() +
+  scale_y_continuous(trans = pseudo_log_trans(sigma = 2e-4, base = 10), breaks = c(0, 0.001, 0.005, 0.02, 0.1, 0.5),
+                     labels = percent_format(accuracy = 0.1)) +
+  scale_colour_manual(values = status_colors, drop = FALSE) +
+  labs(x = "Depth", y = "VAF (k / n)", colour = NULL) +
+  theme_classic()
+```
+
+
+# 3. Unfiltered trajectories
+
+A timepoint is detected if the table has at least `min_alt_reads` = `r min_alt_reads` read of the variant allele. This is
+the rule of the SHCS timepoints added from the pileup: at the position of a clone the individual is known to carry, any
+read of the allele is taken as the clone. Timepoints with few reads can be error; `lod_status` says where they stand against
+the LoD.
+
+```{r grid}
+grid_all <- fabre %>% mutate(detected = k >= min_alt_reads, source = ifelse(detected, "read counts", "not detected"))
+
+grid_all %>%
+  mutate(reads = case_when(k == 0 ~ "0 reads",
+                           !called ~ "1 read to k* - 1 (not called)",
+                           lod_status == "called, VAF < LoD" ~ ">= k*, VAF < LoD",
+                           TRUE ~ "VAF >= LoD"),
+         reads = factor(reads, levels = c("0 reads", "1 read to k* - 1 (not called)", ">= k*, VAF < LoD", "VAF >= LoD"))) %>%
+  count(reads, name = "timepoints") %>%
+  mutate(share = percent(timepoints / sum(timepoints), 0.1)) %>%
+  knitr::kable()
+
+record_step("1-3. Variants in the genes of SHCS, age <= max_age", grid_all)
+```
+
+The trajectories of the first 50 individuals. Cross: timepoint without a read of the variant (drawn at 0). Dashed line: 2%.
+
+```{r plot-unfiltered, fig.width=14, fig.height=11}
+grid_all %>%
+  filter(ID %in% unique(grid_all$ID)[1:50]) %>%
+  mutate(AF_plot = AF) %>%
+  plot_traj("source", c("read counts" = 16, "not detected" = 4), "SardiNIA variants, unfiltered (first 50 individuals)",
+            facet = "ID", ncol = 10)
+```
+
+
+# 4. Filter: VAF >= 2% and LoD
+
+A trajectory is kept if at least one timepoint has a VAF >= 2% and at least `min_tp_above_lod` = `r min_tp_above_lod`
+timepoints have a VAF >= LoD.
+
+```{r filter-vaf}
+traj_vaf_summary <- grid_all %>%
+  filter(detected) %>%
+  group_by(ID, traj_id, Gene.refGene) %>%
+  summarise(detected_timepoints = n(), max_AF = max(AF), above_lod = sum(lod_status == "VAF >= LoD"), .groups = "drop")
+
+# effect of the LoD requirement
+map_dfr(1:2, function(m) {
+  traj_vaf_summary %>%
+    summarise(`timepoints >= LoD required` = m,
+              `max VAF >= 2%` = sum(max_AF >= chip_vaf),
+              `max VAF >= 2% and enough timepoints >= LoD` = sum(max_AF >= chip_vaf & above_lod >= m),
+              individuals = n_distinct(ID[max_AF >= chip_vaf & above_lod >= m]))
+}) %>%
+  knitr::kable(caption = "Trajectories kept")
+
+traj_vaf_summary <- traj_vaf_summary %>%
+  mutate(reason = case_when(max_AF < chip_vaf             ~ "removed: max VAF < 2%",
+                            above_lod < min_tp_above_lod  ~ "removed: too few timepoints >= LoD",
+                            TRUE                          ~ "kept"))
+
+traj_vaf_summary %>%
+  group_by(reason) %>%
+  summarise(trajectories = n(), individuals = n_distinct(ID), `detected timepoints, median` = median(detected_timepoints),
+            `max VAF %, median` = round(100 * median(max_AF), 2)) %>%
+  knitr::kable()
+
+traj_vaf <- traj_vaf_summary$traj_id[traj_vaf_summary$reason == "kept"]
+grid_vaf <- grid_all %>% filter(traj_id %in% traj_vaf)
+
+record_step("4. >= 1 timepoint with VAF >= 2% and >= min_tp_above_lod timepoints >= LoD", grid_vaf)
+```
+
+```{r plot-vaf, fig.width=12, fig.height=7}
+grid_vaf %>%
+  mutate(AF_plot = AF) %>%
+  plot_traj("source", c("read counts" = 16, "not detected" = 4), "After section 4")
+```
+
+
+# 5. Filter: >= 2 detected timepoints
+
+A trajectory is kept if it has at least `min_timepoints` = `r min_timepoints` detected timepoints, at least one of them with
+VAF >= 2%. After section 4 every trajectory has a timepoint >= 2%, so the filter removes the trajectories seen at a single
+timepoint.
+
+```{r filter-timepoints}
+traj_tp_summary <- grid_vaf %>%
+  group_by(ID, traj_id, Gene.refGene) %>%
+  summarise(timepoints = n(), detected_timepoints = sum(detected), max_AF = max(AF[detected]), .groups = "drop") %>%
+  mutate(kept = detected_timepoints >= min_timepoints & max_AF >= chip_vaf)
+
+traj_tp_summary %>%
+  count(kept, name = "trajectories") %>%
+  knitr::kable()
+
+if (any(!traj_tp_summary$kept)) traj_tp_summary %>%
+  filter(!kept) %>%
+  arrange(ID) %>%
+  transmute(ID, traj_id, Gene.refGene, timepoints, detected_timepoints, `max VAF %` = round(100 * max_AF, 2)) %>%
+  knitr::kable(caption = "Trajectories removed")
+
+traj_tp <- traj_tp_summary$traj_id[traj_tp_summary$kept]
+grid_tp <- grid_vaf %>% filter(traj_id %in% traj_tp)
+
+record_step("5. >= 2 detected timepoints, >= 1 with VAF >= 2%", grid_tp)
+```
+
+
+# 6. LoD and not detected timepoints
+
+## 6.1 LoD at every timepoint
+
+Mean and sd of the LoD over all timepoints of each trajectory, the trajectory-specific LoD (`traj_lod_mean`) used in the
+notebooks that follow:
+
+```{r lod-traj}
+lod_traj <- grid_tp %>%
+  group_by(ID, traj_id, Gene.refGene) %>%
+  summarise(timepoints = n(), lod_mean = mean(lod_vaf), lod_sd = sd(lod_vaf), .groups = "drop") %>%
+  mutate(lod_cv = lod_sd / lod_mean)
+
+lod_traj %>%
+  summarise(trajectories = n(),
+            `mean LoD %, median (IQR)` = med_iqr(lod_mean, 3, 100),
+            `mean LoD %, range` = paste(round(100 * range(lod_mean), 3), collapse = "-"),
+            `sd of LoD %, median (IQR)` = med_iqr(lod_sd, 3, 100),
+            `sd of LoD %, max` = round(100 * max(lod_sd), 3),
+            `CV (sd / mean), median (IQR)` = med_iqr(lod_cv, 2)) %>%
+  knitr::kable(caption = "LoD per trajectory")
+```
+
+```{r lod-traj-plot, fig.width=12, fig.height=5}
+p_mean <- ggplot(lod_traj, aes(x = lod_mean)) +
+  geom_histogram(bins = 30, fill = "grey60", colour = "white") +
+  scale_x_continuous(labels = percent) +
+  labs(x = "Mean LoD of the trajectory (VAF)", y = "Trajectories") +
+  theme_classic()
+
+p_range <- lod_traj %>%
+  mutate(traj_id = fct_reorder(traj_id, lod_mean)) %>%
+  ggplot(aes(x = traj_id, y = lod_mean, ymin = lod_mean - lod_sd, ymax = lod_mean + lod_sd, colour = Gene.refGene)) +
+  geom_pointrange(size = 0.2) +
+  scale_y_continuous(labels = percent) +
+  scale_colour_manual(values = gene_colors) +
+  labs(x = "Trajectories (ordered by mean LoD)", y = "LoD, mean +/- sd", colour = "CHIP gene") +
+  theme_classic() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+ggarrange(p_mean, p_range, ncol = 2, widths = c(1, 1.6), labels = c("A", "B"))
+```
+
+
+## 6.2 VAF of the not detected timepoints
+
+A not detected timepoint gets `impute_fraction` = `r impute_fraction` times the LoD of the timepoint, which depends on the
+depth at the variant in this sample. Runs of consecutive not detected timepoints are shortened as in SHCS: before the first
+detected timepoint only the last one is kept, after the last detected timepoint only the first, i.e. the one closest to a
+detected timepoint. Not detected timepoints between two detected ones are all kept.
+
+```{r impute}
+grid_imp <- grid_tp %>%
+  left_join(lod_traj %>% select(traj_id, lod_mean, lod_sd), by = "traj_id") %>%
+  mutate(imputed = !detected,
+         AF      = ifelse(imputed, impute_fraction * lod_vaf, AF),
+         source  = ifelse(imputed, "imputed", source)) %>%
+  arrange(traj_id, Age_exact) %>%
+  group_by(traj_id) %>%
+  mutate(position = case_when(detected                        ~ "detected",
+                              cumsum(detected) == 0           ~ "before the first detected timepoint",
+                              rev(cumsum(rev(detected))) == 0 ~ "after the last detected timepoint",
+                              TRUE                            ~ "between two detected timepoints"),
+         keep = detected | position == "between two detected timepoints" |
+                (position == "before the first detected timepoint" & lead(detected, default = FALSE)) |
+                (position == "after the last detected timepoint" & lag(detected, default = FALSE))) %>%
+  ungroup()
+
+grid_imp %>%
+  filter(imputed) %>%
+  group_by(position) %>%
+  summarise(`not detected timepoints` = n(), kept = sum(keep), removed = sum(!keep), trajectories = n_distinct(traj_id),
+            `imputed VAF %, median (range)` = sprintf("%.3f (%.3f-%.3f)", 100 * median(AF), 100 * min(AF), 100 * max(AF))) %>%
+  knitr::kable()
+
+grid_keep <- grid_imp %>% filter(keep) %>% select(-position, -keep)
+
+record_step("6.2 + not detected timepoints at LoD/2, runs shortened", grid_keep)
+```
+
+Timepoints with few reads can have a lower VAF than a not detected timepoint at the same depth:
+`r sum(!grid_imp$imputed & grid_imp$AF < impute_fraction * grid_imp$lod_vaf)` of the `r sum(!grid_imp$imputed)` detected
+timepoints are below `impute_fraction` times the LoD of their timepoint.
+
+
+## 6.3 Trajectories the spline can use
+
+The spline (`spline_functions.R`) cannot be fitted to fewer than `min_spline_tp` = `r min_spline_tp` timepoints. Every SHCS
+trajectory has at least 3; here this concerns the individuals with only 2 phases, whose trajectories have 2 detected
+timepoints and no other.
+
+```{r filter-spline}
+traj_final <- grid_keep %>%
+  group_by(traj_id) %>%
+  summarise(ID = first(ID), Gene.refGene = first(Gene.refGene), timepoints = n(), detected_timepoints = sum(detected),
+            max_AF = max(AF), .groups = "drop")
+
+if (any(traj_final$timepoints < min_spline_tp)) traj_final %>%
+  filter(timepoints < min_spline_tp) %>%
+  transmute(ID, traj_id, Gene.refGene, timepoints, detected_timepoints, `max VAF %` = round(100 * max_AF, 2)) %>%
+  knitr::kable(caption = "Trajectories removed")
+
+grid_final <- grid_keep %>% filter(traj_id %in% traj_final$traj_id[traj_final$timepoints >= min_spline_tp])
+
+record_step("6.3 >= 3 timepoints in the final trajectory", grid_final)
+```
+
+Final trajectories, log scale. Filled circle: read counts; open circle: imputed.
+
+```{r plot-final-log, fig.width=12, fig.height=7}
+grid_final %>%
+  mutate(AF_plot = AF) %>%
+  plot_traj("source", shape_final, "Final trajectories, not detected timepoints at LoD / 2", y_log = TRUE)
+```
+
+
+## 6.4 Trajectory-specific LoD
+
+One trajectory per panel. Black dotted line: LoD of each timepoint, from the depth at the variant in that sample. Filled
+circle: read counts; open circle: imputed (half the LoD of the timepoint); cross: not detected timepoint removed when the
+runs were shortened (drawn at 0). Dashed line: 2%. Pseudo-logarithmic y axis.
+
+```{r plot-traj-lod, fig.width=20, fig.height=30}
+vaf_trans  <- pseudo_log_trans(sigma = 2e-4, base = 10)
+vaf_breaks <- c(0, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3)
+
+lod_panels <- grid_imp %>%
+  filter(traj_id %in% grid_final$traj_id) %>%
+  mutate(panel   = paste(ID, Gene.refGene, sub(".*:", "", Variant)),
+         point   = ifelse(keep, source, "not detected"),
+         AF_plot = ifelse(keep, AF, 0))
+
+ggplot(lod_panels, aes(x = Age_exact)) +
+  geom_line(aes(y = lod_vaf, linetype = "LoD of the timepoint"), colour = "black", linewidth = 0.4) +
+  geom_line(data = filter(lod_panels, keep), aes(y = AF_plot, colour = Gene.refGene), linewidth = 0.4) +
+  geom_point(aes(y = AF_plot, colour = Gene.refGene, shape = point), size = 1.2) +
+  geom_hline(yintercept = chip_vaf, linewidth = 0.3, linetype = "dashed") +
+  scale_y_continuous(trans = vaf_trans, breaks = vaf_breaks, labels = percent_format(accuracy = 0.1)) +
+  scale_colour_manual(values = gene_colors) +
+  scale_shape_manual(values = c(shape_final, "not detected" = 4)) +
+  scale_linetype_manual(values = c("LoD of the timepoint" = "dotted")) +
+  facet_wrap(~panel, ncol = 14, scales = "free_x") +
+  labs(x = "Age", y = "VAF", colour = "CHIP gene", shape = NULL, linetype = NULL) +
+  theme_classic(base_size = 9) +
+  theme(strip.text = element_text(size = 5), legend.position = "bottom")
+```
+
+
+# 7. Counts after each step
+
+```{r step-counts}
+knitr::kable(step_counts)
+```
+
+
+# 8. Final table
+
+One row per trajectory and timepoint, with the column names of the SHCS table where the content is the same (`ID`, `traj_id`,
+`N_CHIP`, `AAChange.refGene`, `Gene.refGene`, `Chr`, `Start`, `End`, `Ref`, `Alt`, `AF`, `Variant`, `source`, `Age`, `lod_depth`,
+`lod_alt_reads`, `lod_vaf`, `lod_status`, `traj_lod_mean`, `traj_lod_sd`), so that the notebooks that follow treat the two
+cohorts alike. `source` is `read_counts` or `imputed`. Specific to SardiNIA: `SardID`, `Gender`, `Phase`, `Type`, `Age_exact`.
+
+```{r final-table}
+sardinia_calls <- grid_final %>%
+  group_by(ID) %>%
+  mutate(N_CHIP = n_distinct(traj_id)) %>%
+  ungroup() %>%
+  transmute(ID, SardID, Gender, Phase, traj_id, N_CHIP, AAChange.refGene, Gene.refGene, Chr, Start, End, Ref, Alt, Type,
+            AF, Variant, source = ifelse(imputed, "imputed", "read_counts"), Age, Age_exact,
+            lod_depth = n, lod_alt_reads = k, lod_vaf, lod_status = as.character(lod_status),
+            traj_lod_mean = lod_mean, traj_lod_sd = lod_sd) %>%
+  arrange(ID, traj_id, Age_exact)
+
+imp <- sardinia_calls %>% filter(source == "imputed")
+stopifnot(!anyNA(sardinia_calls$AF), !anyNA(sardinia_calls$lod_vaf), all(abs(imp$AF / imp$lod_vaf - impute_fraction) < 1e-9),
+          !anyDuplicated(sardinia_calls[c("traj_id", "Age")]))
+
+table(source = sardinia_calls$source)
+
+write.table(sardinia_calls, file.path(resources_lod, "sardinia_chip_calls_long_filtered.txt"), sep = "\t", quote = F, row.names = F)
+```
+
+
+# 9. Plots and tables
+
+## 9.1 Trajectories
+
+```{r final-traj, fig.width=12, fig.height=7}
+measurement_plot <- sardinia_calls %>%
+  mutate(measurement = ifelse(source == "imputed", "imputed", "read counts"),
+         Gene.refGene = factor(Gene.refGene, levels = intersect(names(gene_colors), Gene.refGene)))
+
+pl <- measurement_plot %>%
+  ggplot(aes(x = Age_exact, y = AF, color = Gene.refGene, group = traj_id)) +
+  geom_point(aes(shape = measurement), size = 1.5) +
+  geom_line(linewidth = 0.7) +
+  scale_color_manual(values = gene_colors) +
+  scale_shape_manual(values = shape_final) +
+  facet_wrap(~Gene.refGene) +
+  geom_hline(yintercept = chip_vaf, linewidth = 0.6, linetype = "dashed") +
+  theme_classic() +
+  labs(x = "Age", y = "VAF (clone size)", color = "CHIP gene", shape = NULL)
+pl
+
+ggsave(file.path(figures_lod, "Sardinia_CHIP_trajectories_filtered.png"), plot = pl, dpi = 300, width = 10, height = 6)
+```
+
+## 9.2 Distribution of the CHIP variants
+
+```{r variants, fig.width=11, fig.height=4}
+traj_variants <- sardinia_calls %>%
+  distinct(ID, traj_id, Gene.refGene, Type) %>%
+  mutate(Gene.refGene = ifelse(Gene.refGene %in% c("DNMT3A", "TET2", "ASXL1", "TP53", "PPM1D"), Gene.refGene, "Other"),
+         Gene.refGene = factor(Gene.refGene, levels = c("DNMT3A", "TET2", "ASXL1", "TP53", "PPM1D", "Other")))
+stopifnot(!anyDuplicated(traj_variants$traj_id))
+
+gene <- traj_variants %>%
+  count(Gene.refGene) %>%
+  ggplot(aes(x = Gene.refGene, y = n, fill = Gene.refGene, label = n)) +
+  geom_col(color = "black") +
+  geom_text(vjust = -0.3) +
+  scale_fill_manual(values = gene_colors, guide = "none") +
+  labs(x = NULL, y = "Trajectories") +
+  theme_classic() +
+  theme(axis.text.x = element_text(size = 12, angle = 45, hjust = 1, face = "italic"))
+
+gene_mut <- traj_variants %>%
+  count(Gene.refGene, Type) %>%
+  ggplot(aes(x = Gene.refGene, y = n, fill = Type, label = n)) +
+  geom_col(color = "black") +
+  geom_text(size = 3, position = position_stack(vjust = 0.5)) +
+  labs(x = NULL, y = "Trajectories", fill = "Mutation type") +
+  theme_classic() +
+  theme(axis.text.x = element_text(size = 12, angle = 45, hjust = 1, face = "italic"))
+
+n_chip <- sardinia_calls %>%
+  distinct(ID, N_CHIP) %>%
+  ggplot(aes(x = N_CHIP)) +
+  geom_bar(color = "black", fill = "grey", linewidth = 0.8) +
+  labs(x = "Number of CHIP variants per individual", y = "Individuals") +
+  theme_classic()
+
+ggarrange(gene, gene_mut, n_chip, ncol = 3, widths = c(1, 1.4, 1), labels = c("A", "B", "C"))
+```
+
+## 9.3 Depth and LoD of every measurement
+
+One row per trajectory and timepoint, in the columns of `results/SHCS_CHIP_variants_depth_LoD.txt`.
+
+```{r variant-table}
+variant_table <- sardinia_calls %>%
+  transmute(SardID = ID, Trajectory = traj_id, Gene = Gene.refGene, Variant, Chr, Position = Start, Ref, Alt, Age,
+            Source = ifelse(source == "imputed", "imputed", "read counts"),
+            Depth = lod_depth, Alt_reads = lod_alt_reads, VAF = round(AF, 5), LoD = round(lod_vaf, 5),
+            Above_LoD = ifelse(source == "imputed", NA, lod_status == "VAF >= LoD"))
+
+table(Source = variant_table$Source, Above_LoD = variant_table$Above_LoD, useNA = "ifany")
+
+write.table(variant_table, file.path(results_lod, "Sardinia_CHIP_variants_depth_LoD.txt"), sep = "\t", quote = F, row.names = F)
+```
+
+## 9.4 Summary of the final trajectories
+
+As `results/SHCS_CHIP_trajectories_summary.txt`. Follow-up is the time from the first to the last timepoint.
+
+```{r trajectory-summary}
+fmt_dist <- function(x, digits = 0, scale = 1) {
+  x <- x * scale
+  q <- quantile(x, c(0.5, 0.25, 0.75))
+  sprintf("%.*f (IQR %.*f-%.*f; range %.*f-%.*f)", digits, q[1], digits, q[2], digits, q[3], digits, min(x), digits, max(x))
+}
+n_of <- function(x, total) sprintf("%d (%.1f%%)", x, 100 * x / total)
+
+final_set <- sardinia_calls %>% mutate(detected = source != "imputed")
+
+per_traj <- final_set %>%
+  group_by(ID, traj_id) %>%
+  summarise(timepoints = n(), n_detected = sum(detected), max_vaf = max(AF[detected]),
+            followup = max(Age_exact) - min(Age_exact), .groups = "drop")
+stopifnot(all(per_traj$max_vaf >= chip_vaf))
+
+per_ind <- final_set %>%
+  group_by(ID) %>%
+  summarise(trajectories = n_distinct(traj_id), samples = n_distinct(Phase),
+            followup = max(Age_exact) - min(Age_exact), age_first = min(Age_exact), .groups = "drop")
+
+n_traj <- nrow(per_traj)
+n_meas <- nrow(final_set)
+traj_counts <- table(per_ind$trajectories)
+
+trajectory_summary <- bind_rows(
+  tibble(Group = "Individuals",
+         Characteristic = c("Individuals", "Trajectories per individual"),
+         Value = c(nrow(per_ind), fmt_dist(per_ind$trajectories))),
+  tibble(Group = "Individuals",
+         Characteristic = paste("Individuals with", names(traj_counts), ifelse(names(traj_counts) == "1", "trajectory", "trajectories")),
+         Value = n_of(as.integer(traj_counts), nrow(per_ind))),
+  tibble(Group = "Individuals",
+         Characteristic = c("Samples per individual", "Follow-up per individual, years", "Age at the first sample, years"),
+         Value = c(fmt_dist(per_ind$samples), fmt_dist(per_ind$followup, 1), fmt_dist(per_ind$age_first))),
+  tibble(Group = "Trajectories",
+         Characteristic = c("Trajectories", "Timepoints per trajectory", "Detected timepoints per trajectory",
+                            "Follow-up per trajectory, years", "Maximum VAF per trajectory, %",
+                            "Trajectories with maximum VAF >= 10%"),
+         Value = c(n_traj, fmt_dist(per_traj$timepoints), fmt_dist(per_traj$n_detected),
+                   fmt_dist(per_traj$followup, 1), fmt_dist(per_traj$max_vaf, 1, 100),
+                   n_of(sum(per_traj$max_vaf >= 0.1), n_traj))),
+  final_set %>%
+    count(source) %>%
+    transmute(Group = "Measurements", Characteristic = paste("Measurements:", source), Value = n_of(n, n_meas)),
+  tibble(Group = "Measurements",
+         Characteristic = c("Measurements", "Depth at the variant", "LoD, %", "Detected measurements with VAF >= LoD"),
+         Value = c(n_meas, fmt_dist(final_set$lod_depth), fmt_dist(final_set$lod_vaf, 2, 100),
+                   n_of(sum(final_set$lod_status == "VAF >= LoD" & final_set$detected), sum(final_set$detected)))),
+  traj_variants %>%
+    count(Gene.refGene) %>%
+    transmute(Group = "Trajectories by gene", Characteristic = as.character(Gene.refGene), Value = n_of(n, n_traj)),
+  traj_variants %>%
+    count(Type, sort = TRUE) %>%
+    transmute(Group = "Trajectories by mutation type", Characteristic = Type, Value = n_of(n, n_traj)))
+
+knitr::kable(trajectory_summary)
+
+write.table(trajectory_summary, file.path(results_lod, "Sardinia_CHIP_trajectories_summary.txt"), sep = "\t", quote = F, row.names = F)
+```
+
+
+## 9.5 The two cohorts
+
+The trajectory-specific LoD comes from the depth at the variant, and SardiNIA is sequenced less deeply at the variants than
+SHCS. An imputed timepoint, and the ages at LoD / 2 and LoD in the notebooks that follow, therefore sit at a higher VAF in
+SardiNIA.
+
+```{r cohorts-lod}
+cohort_rows <- bind_rows(
+  shcs %>% transmute(Cohort = "SHCS", ID = as.character(ID), traj_id, Age, AF, source = ifelse(source == "imputed", "imputed", "measured"),
+                     depth = lod_depth, lod_vaf, traj_lod_mean),
+  sardinia_calls %>% transmute(Cohort = "Sardinia", ID, traj_id, Age, AF, source = ifelse(source == "imputed", "imputed", "measured"),
+                               depth = lod_depth, lod_vaf, traj_lod_mean))
+
+cohort_rows %>%
+  group_by(Cohort) %>%
+  summarise(individuals = n_distinct(ID), trajectories = n_distinct(traj_id), measurements = n(),
+            `measurements per trajectory, median` = median(table(traj_id)),
+            `imputed measurements` = n_pct(source == "imputed"),
+            `trajectories with an imputed measurement` = n_distinct(traj_id[source == "imputed"]),
+            `depth, median (IQR)` = med_iqr(depth),
+            `LoD of the timepoint %, median (IQR)` = med_iqr(lod_vaf, 3, 100),
+            `age, median (IQR)` = med_iqr(Age)) %>%
+  knitr::kable()
+
+traj_lods <- cohort_rows %>% distinct(Cohort, traj_id, traj_lod_mean)
+
+traj_lods %>%
+  group_by(Cohort) %>%
+  summarise(`LoD of the trajectory %, median (IQR)` = med_iqr(traj_lod_mean, 3, 100),
+            `LoD / 2 of the trajectory %, median (IQR)` = med_iqr(traj_lod_mean / 2, 3, 100)) %>%
+  knitr::kable()
+
+wilcox.test(traj_lod_mean ~ Cohort, data = traj_lods)
+```
+
+```{r cohorts-lod-plot, fig.width=5, fig.height=3.5}
+ggplot(traj_lods, aes(x = traj_lod_mean, fill = Cohort)) +
+  geom_density(alpha = 0.6) +
+  scale_x_log10(labels = percent) +
+  scale_fill_manual(values = hiv_colors) +
+  labs(x = "LoD of the trajectory (mean over its timepoints)", y = "Density") +
+  theme_classic()
+```
+
+Mutation types. The SHCS trajectories come from calls filtered on the CHIP definition of `CHIP_candidate_variants.csv` (for
+example, only some of the missense variants of a gene); the SardiNIA table lists all non-synonymous variants.
+
+```{r cohorts-type}
+bind_rows(shcs %>% distinct(traj_id, type = ExonicFunc.refGene) %>% mutate(Cohort = "SHCS"),
+          sardinia_calls %>% distinct(traj_id, type = gsub("_", " ", Type)) %>% mutate(Cohort = "Sardinia")) %>%
+  mutate(type = ifelse(type %in% c("splicing", "splice site"), "splice site", type)) %>%
+  count(Cohort, type) %>%
+  group_by(Cohort) %>%
+  mutate(cell = sprintf("%d (%.0f%%)", n, 100 * n / sum(n))) %>%
+  select(-n) %>%
+  pivot_wider(names_from = Cohort, values_from = cell, values_fill = "0") %>%
+  knitr::kable()
+```
+
+
+## 9.6 Against an earlier selection
+
+A comparison with an earlier version of the analysis (`resources/sardinia_chip_calls_long_filtered.txt`, not part of
+this repository); it runs only if that file is present:
+
+```{r previous-set, eval = file.exists("resources/sardinia_chip_calls_long_filtered.txt")}
+old_calls <- read.table("resources/sardinia_chip_calls_long_filtered.txt", sep = "\t", header = TRUE) %>%
+  mutate(CHR = as.character(CHR))
+
+old_keys <- old_calls %>% distinct(ID = SardID, Chr = CHR, Start = START, Ref = REF, Alt = ALT) %>% mutate(previous = TRUE)
+new_keys <- sardinia_calls %>% mutate(Chr = as.character(Chr)) %>% distinct(ID, Chr, Start, Ref, Alt, traj_id, Gene.refGene) %>% mutate(new = TRUE)
+both <- full_join(old_keys, new_keys, by = c("ID", "Chr", "Start", "Ref", "Alt"))
+
+table(`previous selection` = !is.na(both$previous), `this selection` = !is.na(both$new))
+
+both %>%
+  filter(is.na(previous) | is.na(new)) %>%
+  left_join(fabre %>% mutate(Chr = as.character(Chr)) %>% group_by(ID, Chr, Start, Ref, Alt) %>%
+              summarise(gene = first(Gene.refGene), timepoints = n(), detected = sum(k >= min_alt_reads), `max VAF %` = 100 * max(VAF), .groups = "drop"),
+            by = c("ID", "Chr", "Start", "Ref", "Alt")) %>%
+  transmute(ID, gene, Chr, Start, Ref, Alt, set = ifelse(is.na(new), "only previous", "only this selection"), timepoints, detected, `max VAF %`) %>%
+  knitr::kable(caption = "Trajectories in only one of the selections")
+
+old_calls %>%
+  summarise(`rows at the fixed 0.01%` = sum(VAF == 1e-4), trajectories = n_distinct(traj_id[VAF == 1e-4])) %>%
+  knitr::kable(caption = "Not detected timepoints of the previous selection (all kept, none shortened)")
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

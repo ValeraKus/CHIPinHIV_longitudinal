@@ -1,0 +1,290 @@
+---
+title: "Non-CHIP variants as controls for the limit of detection"
+author: "Valeriia Timonina"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 5)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+The alleles outside the CHIP positions over time, as a control for the limit of
+detection. This notebook redraws, with the participant ids of the paper, two figures of
+`01_per_sample_LoD_and_QC.Rmd` (sections 6.2 and 7): every non-CHIP allele of every longitudinal participant over
+age, and three panels on detection (depth at CHIP against non-CHIP positions, how often a low-VAF allele is missed, VAF
+against depth). It reads the bam-readcount pile-ups and writes
+
+- `figures/paper/additional/nonCHIP_alleles_over_time.png`,
+- `figures/paper/additional/nonCHIP_detection.png`,
+- `results/paper/nonCHIP_summary.txt` (the numbers for the text),
+- `results/paper/SHCS_ids_all_sequenced.txt` (new ids of all participants with serial samples).
+
+```{r libraries}
+source("R/paper_functions.R")
+```
+
+# Parameters
+
+```{r parameters}
+# One sample is in the pileup twice, under two suffixed names (01_per_sample_LoD_and_QC.Rmd, section 3.1: the two
+# runs hold the same reads). resources/pileup_sample_names.txt lists the run to use and the run to drop
+# (tab-separated: pileup_name, action = use / drop, sample)
+pileup_names <- read.delim("resources/pileup_sample_names.txt", colClasses = "character")
+pileup_sample_alias <- with(subset(pileup_names, action == "use"), setNames(sample, pileup_name))
+pileup_sample_drop  <- subset(pileup_names, action == "drop")$pileup_name
+
+foreign_color <- "red3"
+foreign_label <- "sample with foreign DNA (removed)"
+```
+
+# 1. Samples, individuals and ids
+
+Sample manifest with the collection date; age at collection is the collection year minus the SHCS birth year
+(`admin.csv` of the SHCS database). The longitudinal participants are those with a Mutect2 VCF, i.e. with serial
+samples; the pile-up also holds one sample of each participant of the cross-sectional screening, which are left out.
+
+```{r samples}
+admin <- read.csv("resources/SHCS_database/2025-12/admin.csv") %>% distinct(ID, BORN)
+stopifnot(!anyDuplicated(admin$ID))
+vcf_files <- list.files("resources/mutect2_Calls/mutect2_output", pattern = "\\.vcf\\.gz$")
+
+samples <- read.csv("resources/samples_with_dates.csv") %>%
+  transmute(Sample  = ID,
+            ID      = as.character(as.numeric(gsub("ID SHCS ", "", Subject.Id))),
+            LABDATE = as.Date(gsub(" 00:00:00", "", Collection), format = "%d/%m/%Y")) %>%
+  left_join(admin %>% mutate(ID = as.character(ID)), by = "ID") %>%
+  mutate(Age     = as.integer(format(LABDATE, "%Y")) - BORN,
+         has_vcf = Sample %in% sub(".vcf.gz$", "", vcf_files))
+stopifnot(!anyDuplicated(samples$Sample))
+
+long_ids <- sort(unique(samples$ID[samples$has_vcf]))
+long_samples <- samples %>% filter(ID %in% long_ids)
+cat(length(long_ids), "longitudinal participants,", nrow(long_samples), "samples in the manifest,",
+    sum(long_samples$has_vcf), "with a VCF;", sum(is.na(long_samples$BORN)), "samples without a birth year\n")
+
+qc <- read_tsv_("resources/SHCS_sample_contamination_QC.txt")
+mixed_samples <- qc$S_ID[qc$mixed]
+mixed_samples
+```
+
+The 50 participants with a CHIP trajectory keep the ids of the paper (`resources/SHCS_change_ids.txt`); the other
+longitudinal participants get ids continuing the series, in increasing order of the SHCS id.
+
+```{r ids}
+ids_paper <- load_ids()
+stopifnot(all(ids_paper$ID %in% long_ids))
+n_paper <- max(as.integer(sub("SHCS_", "", ids_paper$SHCS_ID_new)))
+stopifnot(n_paper == nrow(ids_paper))
+ids_all <- tibble(ID = long_ids) %>%
+  left_join(ids_paper, by = "ID") %>%
+  mutate(has_trajectory = !is.na(SHCS_ID_new)) %>%
+  arrange(has_trajectory == FALSE, as.numeric(ID))
+ids_all$SHCS_ID_new[!ids_all$has_trajectory] <- paste0("SHCS_", n_paper + seq_len(sum(!ids_all$has_trajectory)))
+ids_all <- ids_all %>% arrange(as.integer(sub("SHCS_", "", SHCS_ID_new)))
+id_levels <- ids_all$SHCS_ID_new
+write_res(ids_all, "SHCS_ids_all_sequenced.txt")
+knitr::kable(ids_all %>% filter(!has_trajectory), caption = "Longitudinal participants without a CHIP trajectory in the final set")
+```
+
+# 2. Pile-ups
+
+One row per sample and position, with the alleles seen at that position packed into `var1..varN` as
+`allele:count:avg_mapq:avg_baseq` (bam-readcount). Overlapping regions list some positions more than once per sample
+(exact duplicates, removed). Only the longitudinal samples are kept. A non-CHIP allele is an allele different from the
+reference base (`N` reads are left out).
+
+```{r pileup}
+read_pileup <- function(file) {
+  read.table(file, sep = "\t", header = TRUE, stringsAsFactors = FALSE, colClasses = c(ref = "character")) %>%
+    distinct() %>%
+    filter(!S_ID %in% pileup_sample_drop) %>%
+    mutate(S_ID = coalesce(unname(pileup_sample_alias[S_ID]), S_ID)) %>%
+    filter(S_ID %in% long_samples$Sample)
+}
+readcount_chip    <- read_pileup("resources/All.chip.bam_readcount.txt")
+readcount_nonchip <- read_pileup("resources/All.nonchip.bam_readcount.txt")
+stopifnot(!anyDuplicated(readcount_chip[c("S_ID", "chr", "pos")]), !anyDuplicated(readcount_nonchip[c("S_ID", "chr", "pos")]))
+
+parse_readcount_long <- function(df) {
+  df %>%
+    select(S_ID, chr, pos, ref, depth, starts_with("var")) %>%
+    pivot_longer(starts_with("var"), names_to = NULL, values_to = "allele_str", values_drop_na = TRUE) %>%
+    separate(allele_str, into = c("allele", "count"), sep = ":", extra = "drop") %>%
+    mutate(count = as.integer(count))
+}
+
+nonchip_alleles <- parse_readcount_long(readcount_nonchip) %>%
+  filter(count > 0, allele != ref, allele != "N", allele != "=") %>%
+  mutate(VAF = count / depth) %>%
+  inner_join(long_samples %>% select(Sample, ID, Age), by = c("S_ID" = "Sample")) %>%
+  inner_join(ids_all %>% select(ID, SHCS_ID_new), by = "ID") %>%
+  mutate(series = paste(ID, chr, pos, allele, sep = ":"), foreign = S_ID %in% mixed_samples)
+
+depth_tbl <- bind_rows(readcount_chip %>% distinct(S_ID, chr, pos, depth) %>% mutate(positions = "CHIP positions"),
+                       readcount_nonchip %>% distinct(S_ID, chr, pos, depth) %>% mutate(positions = "non-CHIP positions"))
+
+cat(n_distinct(readcount_nonchip$S_ID), "longitudinal samples in the non-CHIP pile-up,",
+    n_distinct(paste(readcount_nonchip$chr, readcount_nonchip$pos)), "non-CHIP positions,",
+    n_distinct(paste(readcount_chip$chr, readcount_chip$pos)), "CHIP positions;",
+    n_distinct(nonchip_alleles$series), "non-CHIP allele series in", n_distinct(nonchip_alleles$ID), "participants\n")
+```
+
+# 3. Non-CHIP alleles over time
+
+Every non-CHIP allele with at least one read in at least one sample of the participant, VAF against age, joined per
+allele across the samples of the participant (a sample without a read of the allele is drawn at 0). Germline variants
+form the bands at 0.5 and 1; the only abrupt departures are in the samples that contained DNA from another person
+(red), which were removed from the study.
+
+```{r series-grid}
+# every series at every sample of its participant: 0 where the allele has no read
+sample_grid <- long_samples %>% filter(Sample %in% readcount_nonchip$S_ID) %>%
+  inner_join(ids_all %>% select(ID, SHCS_ID_new), by = "ID") %>%
+  transmute(S_ID = Sample, ID, SHCS_ID_new, Age, foreign = S_ID %in% mixed_samples)
+series_tbl <- nonchip_alleles %>% distinct(ID, series)
+series_grid <- series_tbl %>%
+  inner_join(sample_grid, by = "ID", relationship = "many-to-many") %>%
+  left_join(nonchip_alleles %>% select(S_ID, series, VAF), by = c("S_ID", "series")) %>%
+  mutate(VAF = replace_na(VAF, 0), SHCS_ID_new = factor(SHCS_ID_new, levels = id_levels))
+cat(nrow(series_grid), "series x sample points\n")
+```
+
+```{r fig-alleles, fig.width=14, fig.height=12}
+p_alleles <- ggplot(series_grid, aes(x = Age, y = VAF, group = series)) +
+  geom_line(linewidth = 0.15, colour = "grey30", alpha = 0.5) +
+  geom_point(data = filter(series_grid, !foreign), size = 0.3, colour = "grey20", alpha = 0.6) +
+  geom_point(data = filter(series_grid, foreign), aes(colour = foreign_label), size = 0.5) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed", linewidth = 0.3) +
+  scale_colour_manual(values = setNames(foreign_color, foreign_label), name = NULL) +
+  scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1)) +
+  facet_wrap(~SHCS_ID_new, ncol = 9) +
+  labs(x = "Age", y = "VAF of the allele") +
+  theme_bw(base_size = 10) +
+  theme(strip.text = element_text(size = 7), strip.background = element_blank(), legend.position = "bottom",
+        panel.grid.minor = element_blank())
+save_extra(p_alleles, "nonCHIP_alleles_over_time", 14, 12)
+p_alleles
+```
+
+# 4. Detection of low-VAF alleles
+
+**a.** Depth at the CHIP and at the non-CHIP positions over all longitudinal samples.
+
+**b.** A series is one allele in one participant. Series with a mean VAF below 2% over the timepoints with at least
+one read of the allele are split into deciles of that mean VAF (the foreign-DNA samples are left out). A timepoint
+is *missed* when the pile-up has no read of the allele; the bars give the share of series missed at least once.
+
+**c.** VAF against depth: every timepoint with at least one read of the somatic-like non-CHIP series (mean VAF below 2%)
+and every measured timepoint of the 71 CHIP trajectories. Alleles at the detection limit are seen only when the depth
+is low enough for a few reads to pass, so their VAF falls with depth; CHIP clones do not show this.
+
+```{r detection-data}
+clean_alleles <- nonchip_alleles %>% filter(!foreign)
+clean_samples <- sample_grid %>% filter(!foreign) %>% count(ID, name = "n_samples")
+series_stats <- clean_alleles %>%
+  group_by(ID, series) %>%
+  summarise(n_detected = n(), mean_VAF = mean(VAF), .groups = "drop") %>%
+  inner_join(clean_samples, by = "ID") %>%
+  mutate(n_missed = n_samples - n_detected, missed_any = n_missed > 0)
+low_series <- series_stats %>%
+  filter(mean_VAF < chip_vaf) %>%
+  mutate(decile = ntile(mean_VAF, 10))
+decile_tbl <- low_series %>%
+  group_by(decile) %>%
+  summarise(series = n(), min_VAF = min(mean_VAF), max_VAF = max(mean_VAF), share_missed = mean(missed_any), .groups = "drop") %>%
+  mutate(range = sprintf("%.2f-%.2f%%", 100 * min_VAF, 100 * max_VAF))
+knitr::kable(decile_tbl, digits = 4, caption = "Low-VAF non-CHIP series by decile of their mean VAF")
+
+depth_med <- depth_tbl %>% group_by(positions) %>% summarise(n = n(), median = median(depth), .groups = "drop")
+knitr::kable(depth_med, caption = "Depth by type of position (longitudinal samples)")
+
+chip_meas <- load_calls() %>%
+  filter(source != "imputed") %>%
+  transmute(group = "CHIP clones (71 trajectories)", depth = lod_depth, VAF = AF)
+vaf_depth <- bind_rows(
+  clean_alleles %>% semi_join(low_series, by = "series") %>% transmute(group = "non-CHIP alleles, mean VAF < 2%", depth, VAF),
+  chip_meas)
+rho_tbl <- vaf_depth %>%
+  group_by(group) %>%
+  summarise(n = n(), rho = cor(depth, VAF, method = "spearman"), p = cor.test(depth, VAF, method = "spearman", exact = FALSE)$p.value, .groups = "drop")
+knitr::kable(rho_tbl, digits = 3, caption = "Spearman correlation of VAF with depth")
+```
+
+```{r fig-detection, fig.width=12, fig.height=4.5}
+group_colors <- c("non-CHIP alleles, mean VAF < 2%" = "#D55E00", "CHIP clones (71 trajectories)" = "#2a78d6")
+
+p_depth <- ggplot(depth_tbl, aes(x = positions, y = depth, fill = positions)) +
+  geom_boxplot(outlier.size = 0.4, width = 0.6) +
+  geom_text(data = depth_med, aes(x = positions, y = max(depth_tbl$depth) * 1.6, label = paste("median", median)), size = 3.2) +
+  scale_y_log10(breaks = c(100, 300, 1000, 3000)) +
+  scale_fill_manual(values = c("CHIP positions" = "#00BFC4", "non-CHIP positions" = "#F8766D"), guide = "none") +
+  labs(x = NULL, y = "Depth (reads)") +
+  theme_classic(base_size = 11)
+
+p_missed <- ggplot(decile_tbl, aes(x = factor(decile), y = share_missed)) +
+  geom_col(fill = "grey60", colour = "black", linewidth = 0.3) +
+  geom_text(aes(label = range), angle = 90, hjust = -0.05, size = 2.6, y = 0.02) +
+  scale_y_continuous(labels = percent, limits = c(0, 1.08), expand = c(0, 0)) +
+  labs(x = "Decile of the mean VAF of the allele series (low to high)", y = "Series missed at ≥ 1 timepoint") +
+  theme_classic(base_size = 11)
+
+p_vaf_depth <- ggplot(vaf_depth, aes(x = depth, y = VAF, colour = group)) +
+  geom_point(size = 0.4, alpha = 0.4) +
+  geom_text(data = rho_tbl %>% mutate(y = c(0.55, 0.9)[match(group, names(group_colors))]),
+            aes(x = 40, y = y, label = sprintf("rho = %.2f", rho)), hjust = 0, size = 3.2, show.legend = FALSE) +
+  scale_x_log10(breaks = c(30, 100, 300, 1000, 3000)) +
+  scale_y_log10(labels = function(x) paste0(formatC(100 * x, format = "fg"), "%")) +
+  scale_colour_manual(values = group_colors, name = NULL) +
+  labs(x = "Depth (reads)", y = "VAF") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "bottom", legend.direction = "vertical", legend.text = element_text(size = 9)) +
+  guides(colour = guide_legend(override.aes = list(size = 2, alpha = 1)))
+
+p_detection <- (p_depth | p_missed | p_vaf_depth) + plot_layout(widths = c(0.8, 1.1, 1.1)) +
+  plot_annotation(tag_levels = "a") & theme(plot.tag = element_text(size = 16))
+save_extra(p_detection, "nonCHIP_detection", 12, 4.5)
+p_detection
+```
+
+# 5. Numbers for the text
+
+```{r summary}
+foreign_tbl <- qc %>%
+  filter(mixed) %>%
+  mutate(ID = as.character(ID)) %>%
+  inner_join(ids_all %>% select(ID, SHCS_ID_new), by = "ID") %>%
+  transmute(SHCS_ID_new, S_ID, LABDATE, foreign_read_share = round(foreign_read_share, 3))
+knitr::kable(foreign_tbl, caption = "Samples with foreign DNA")
+
+summary_tbl <- tribble(
+  ~quantity, ~value,
+  "longitudinal samples in the pile-up", as.character(n_distinct(readcount_nonchip$S_ID)),
+  "longitudinal participants", as.character(n_distinct(readcount_nonchip$S_ID[readcount_nonchip$S_ID %in% sample_grid$S_ID]) > 0 && length(long_ids)),
+  "non-CHIP positions in the pile-up", as.character(n_distinct(paste(readcount_nonchip$chr, readcount_nonchip$pos))),
+  "CHIP positions in the pile-up", as.character(n_distinct(paste(readcount_chip$chr, readcount_chip$pos))),
+  "non-CHIP allele series (>= 1 read in >= 1 sample)", as.character(n_distinct(nonchip_alleles$series)),
+  "non-CHIP allele series with mean VAF < 2% (foreign-DNA samples excluded)", as.character(nrow(low_series)),
+  "median depth at CHIP positions", as.character(depth_med$median[depth_med$positions == "CHIP positions"]),
+  "median depth at non-CHIP positions", as.character(depth_med$median[depth_med$positions == "non-CHIP positions"]),
+  "share of low-VAF series missed at >= 1 timepoint, lowest decile", sprintf("%.1f%% (mean VAF %s)", 100 * decile_tbl$share_missed[1], decile_tbl$range[1]),
+  "share of low-VAF series missed at >= 1 timepoint, highest decile", sprintf("%.1f%% (mean VAF %s)", 100 * decile_tbl$share_missed[10], decile_tbl$range[10]),
+  "foreign-DNA samples (new id: share of foreign reads)", paste(sprintf("%s: %.1f%%", foreign_tbl$SHCS_ID_new, 100 * foreign_tbl$foreign_read_share), collapse = "; "),
+  "Spearman rho of VAF with depth, non-CHIP series with mean VAF < 2%", sprintf("%.2f (n = %d, p = %s)", rho_tbl$rho[rho_tbl$group == names(group_colors)[1]], rho_tbl$n[rho_tbl$group == names(group_colors)[1]], ifelse(rho_tbl$p[rho_tbl$group == names(group_colors)[1]] < 1e-300, "< 1e-300", fmt_p(rho_tbl$p[rho_tbl$group == names(group_colors)[1]]))),
+  "Spearman rho of VAF with depth, CHIP measurements", sprintf("%.2f (n = %d, p = %s)", rho_tbl$rho[rho_tbl$group == names(group_colors)[2]], rho_tbl$n[rho_tbl$group == names(group_colors)[2]], fmt_p(rho_tbl$p[rho_tbl$group == names(group_colors)[2]])))
+summary_tbl$value[2] <- as.character(length(long_ids))
+write_res(summary_tbl, "nonCHIP_summary.txt")
+knitr::kable(summary_tbl)
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,231 @@
+---
+title: "Figure 2 (CHIP dynamics in PWH) and Figures S7-S8"
+author: "Valeriia Timonina"
+date: "2026-11-06"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+Figure 2 on the REML curves of the 71 trajectories (`resources/LoD/`): the per-trajectory
+statistics by gene (maximal VAF, mean speed, mean acceleration, age at LoD/2 and age at 2% VAF), the gene-level tests and
+the correlation with the fitness effects of Fabre et al. 2022, the correlation heatmap of the statistics, the scheme of
+the two modes of growth, and the final consensus DTW clusters (`03_consensus_clusters.Rmd`). Also the
+supplementary figures of the statistics by cluster (Figure S7) and of the individuals with several trajectories by cluster
+(Figure S8). The sign
+of the mean speed and of the mean acceleration of each trajectory is checked against the 95% interval from the posterior
+of the spline coefficients.
+
+```{r libraries}
+source("R/paper_functions.R")
+library(gratia)
+
+calls <- load_calls()
+pred  <- load_pred()
+sum_  <- load_sum()
+ages  <- load_ages()
+cl    <- load_final_clusters()
+fabre <- load_fabre()
+k_cl  <- n_distinct(cl$cluster)
+sum_c <- sum_ %>% inner_join(cl %>% select(traj_id, cluster), by = "traj_id")
+stopifnot(nrow(sum_c) == 71)
+n_draws <- 1000
+```
+
+# 1. Uncertainty of the per-trajectory statistics: the posterior of the spline
+
+```{r reml-ci}
+reml_draws <- calls %>% group_split(traj_id) %>% map_dfr(function(obs) {
+  obs <- arrange(obs, Age)
+  f <- fit_traj(obs$Age, obs$AF, spec_main)
+  ag <- curve_ages(obs$Age, f$predict, FALSE)
+  n <- length(ag)
+  fs <- fitted_samples(f$model, n = n_draws, data = data.frame(Age = c(ag, ag + step)), seed = 1) %>% arrange(.draw, .row)
+  m <- matrix(fs$.fitted, nrow = 2 * n)
+  speed <- (m[(n + 1):(2 * n), , drop = FALSE] - m[1:n, , drop = FALSE]) / step
+  acc <- rbind(0, apply(speed, 2, diff)) / step
+  tibble(traj_id = obs$traj_id[1], draw = seq_len(ncol(m)), mean_VAF_speed = colMeans(speed), mean_VAF_acceleration = colMeans(acc))
+})
+reml_ci <- reml_draws %>% group_by(traj_id) %>%
+  summarise(across(c(mean_VAF_speed, mean_VAF_acceleration), list(lo = ~ quantile(.x, 0.025), hi = ~ quantile(.x, 0.975))), .groups = "drop") %>%
+  inner_join(sum_ %>% select(traj_id, SHCS_ID_new, mean_VAF_speed, mean_VAF_acceleration), by = "traj_id") %>%
+  mutate(speed_sign_robust = mean_VAF_speed_lo > 0 | mean_VAF_speed_hi < 0, acc_sign_robust = mean_VAF_acceleration_lo > 0 | mean_VAF_acceleration_hi < 0)
+write_res(reml_ci, "fig2_reml_posterior_ci.txt")
+reml_ci %>% summarise(trajectories = n(), `mean speed > 0` = sum(mean_VAF_speed > 0), `mean speed > 0, interval excludes 0` = sum(mean_VAF_speed > 0 & speed_sign_robust),
+                      `mean speed < 0, interval excludes 0` = sum(mean_VAF_speed < 0 & speed_sign_robust),
+                      `mean acceleration: interval excludes 0` = sum(acc_sign_robust)) %>% knitr::kable()
+```
+
+# 2. Figure 2a-e: dynamics by gene
+
+```{r fig2abcde, fig.width=18, fig.height=4.5}
+p2a <- box_by_gene(sum_, "max_VAF", "VAF (max)", chip_vaf)
+p2b <- box_by_gene(sum_, "mean_VAF_speed", "VAF speed (mean)", 0)
+p2c <- box_by_gene(sum_, "mean_VAF_acceleration", "VAF acceleration (mean)", 0)
+p2d <- box_by_gene(sum_, "Age_LoD2", "Age at LoD/2", median(sum_$Age_LoD2, na.rm = TRUE))
+p2e <- box_by_gene(sum_, "Age_0.02", "Age at 2% VAF", median(sum_$Age_0.02, na.rm = TRUE))
+panels <- list(a = p2a, b = p2b, c = p2c, d = p2d, e = p2e)
+names_ <- c(a = "max_VAF", b = "mean_speed", c = "mean_acceleration", d = "age_LoD2", e = "age_2pct")
+for (nm in names(panels)) save_panel(panels[[nm]], 2, paste0("Fig2", nm, "_", names_[[nm]], "_by_gene"), 4, 4.5)
+p_2ae <- (p2a | p2b | p2c | p2d | p2e) + plot_annotation(tag_levels = "a") & tag_theme
+p_2ae
+```
+
+## 2.1 Gene-level statistics
+
+```{r gene-stats}
+g5 <- sum_ %>% filter(Gene.refGene %in% main_genes) %>% mutate(group = ifelse(Gene.refGene %in% c("DNMT3A", "TP53"), "DNMT3A, TP53", "TET2, ASXL1, PPM1D"))
+gene_tab <- sum_ %>% group_by(Gene = Gene.refGene) %>%
+  summarise(n = n(), `mean speed, gene mean` = mean(mean_VAF_speed), `mean speed, median` = median(mean_VAF_speed),
+            `max VAF, median` = median(max_VAF), `mean acceleration, median` = median(mean_VAF_acceleration),
+            `age at LoD/2, median` = median(Age_LoD2, na.rm = TRUE), `age at 2%, median` = median(Age_0.02, na.rm = TRUE),
+            `growing (mean speed > 0)` = sum(mean_VAF_speed > eps_group), `shrinking` = sum(mean_VAF_speed < -eps_group),
+            `accelerating (mean acc > 0)` = sum(mean_VAF_acceleration > eps_group), .groups = "drop")
+knitr::kable(gene_tab, digits = 4)
+fc <- fabre_cor(sum_, fabre)
+first_age <- calls %>% group_by(traj_id) %>% summarise(a = min(Age), .groups = "drop")
+tests <- tibble(
+  test = c("Mann-Whitney, DNMT3A + TP53 vs TET2 + ASXL1 + PPM1D (mean speed)", "Kruskal-Wallis across the 5 genes (mean speed)",
+           "Kruskal-Wallis across the 5 genes (mean acceleration)", "Kruskal-Wallis across the 5 genes (age at LoD/2)", "Kruskal-Wallis across the 5 genes (age at 2% VAF)",
+           "Pearson r, gene mean speed vs Fabre gene effect (one-sided)", "Fabre correlation p",
+           "trajectories with mean speed > 0", "trajectories with mean acceleration > 0",
+           "trajectories with mean speed > 0 and a 95% posterior interval excluding 0", "trajectories with mean speed < 0 and a 95% posterior interval excluding 0",
+           "median age at LoD/2 (IQR)", "median age at 2% VAF (IQR)", "trajectories with an estimated age at LoD/2", "trajectories with an estimated age at 2%",
+           "trajectories that crossed 2% during follow-up", "trajectories not detected at the first timepoint"),
+  value = c(fmt_p(wilcox.test(mean_VAF_speed ~ group, data = g5, exact = FALSE)$p.value),
+            fmt_p(kruskal.test(mean_VAF_speed ~ Gene.refGene, data = g5)$p.value),
+            fmt_p(kruskal.test(mean_VAF_acceleration ~ Gene.refGene, data = g5)$p.value),
+            fmt_p(kruskal.test(Age_LoD2 ~ Gene.refGene, data = g5)$p.value),
+            fmt_p(kruskal.test(Age_0.02 ~ Gene.refGene, data = g5)$p.value),
+            sprintf("%.2f", fc$r), fmt_p(fc$p),
+            sum(sum_$mean_VAF_speed > eps_group), sum(sum_$mean_VAF_acceleration > eps_group),
+            sum(reml_ci$mean_VAF_speed > 0 & reml_ci$speed_sign_robust), sum(reml_ci$mean_VAF_speed < 0 & reml_ci$speed_sign_robust),
+            iqr_txt(sum_$Age_LoD2), iqr_txt(sum_$Age_0.02), sum(!is.na(sum_$Age_LoD2)), sum(!is.na(sum_$Age_0.02)),
+            sum(!is.na(sum_$Age_0.02) & sum_$Age_0.02 > first_age$a[match(sum_$traj_id, first_age$traj_id)] + 0.25),
+            sum((calls %>% group_by(traj_id) %>% arrange(Age) %>% summarise(f = first(source) == "imputed"))$f)))
+knitr::kable(tests)
+write_res(gene_tab, "fig2_gene_table.txt"); write_res(tests, "fig2_tests.txt")
+knitr::kable(fc$genes, digits = 4, caption = "Gene means against the Fabre et al. gene effects")
+```
+
+# 3. Figure 2f-g: correlations of the statistics and the two modes of growth
+
+```{r fig2f, fig.width=8, fig.height=7}
+col_order <- c("N_CHIP_more1", "mean_VAF", "sd_VAF", "min_VAF", "max_VAF", "mean_VAF_speed", "max_VAF_speed", "mean_VAF_acceleration",
+               "mean_Age", "min_Age", "max_Age", "Time", "Age_LoD2", "Age_0.02")
+hm <- corr_heatmap(sum_ %>% select(all_of(col_order)), col_order, stat_labels, size = 16)
+save_panel(hm, 2, "Fig2f_statistics_heatmap", 8, 7)
+hm
+rc <- Hmisc::rcorr(as.matrix(sum_[, col_order]), type = "spearman")
+cor_long <- as.data.frame(rc$r) %>% rownames_to_column("stat1") %>% pivot_longer(-stat1, names_to = "stat2", values_to = "rho") %>%
+  mutate(p = as.vector(rc$P)) %>% filter(match(stat1, col_order) > match(stat2, col_order))
+write_res(cor_long, "fig2f_correlations.txt")
+cor_long %>% filter(stat1 %in% c("Age_LoD2", "Age_0.02", "mean_VAF_acceleration", "mean_VAF_speed") | stat2 %in% c("Age_LoD2", "Age_0.02", "mean_VAF_acceleration", "mean_VAF_speed")) %>%
+  mutate(rho = round(rho, 2), p = signif(p, 2)) %>% knitr::kable()
+```
+
+```{r fig2g, fig.width=5, fig.height=4}
+# the drawn scheme of the two modes of growth (assets/Fig2g_two_modes_scheme.png)
+scheme_png <- png::readPNG("assets/Fig2g_two_modes_scheme.png")
+p_2g <- wrap_elements(full = grid::rasterGrob(scheme_png, interpolate = TRUE))
+p_2g
+```
+
+# 4. Figure 2h-j: the consensus clusters
+
+```{r fig2hij, fig.width=14, fig.height=4.5}
+p2h <- cluster_curves_plot(pred, cl) + labs(y = "VAF")
+p2i <- cluster_box(sum_c, "mean_VAF_speed", "VAF speed (mean)", clusters = cl) + theme(axis.text.x = element_text(size = 12))
+p2j <- cluster_genes_plot(cl, calls %>% distinct(traj_id, Gene = Gene.refGene)) + theme(axis.text.x = element_text(size = 12))
+save_panel(p2h, 2, "Fig2h_clusters_curves", 3 * k_cl + 1, 4.5); save_panel(p2i, 2, "Fig2i_speed_by_cluster", 4, 4.5); save_panel(p2j, 2, "Fig2j_genes_by_cluster", 4, 4.5)
+p_2hij <- (p2h | p2i | p2j) + plot_layout(widths = c(1.1 * k_cl, 1, 1)) + plot_annotation(tag_levels = list(c("h", "i", "j"))) & tag_theme
+p_2hij
+```
+
+## 4.1 Cluster description
+
+```{r cluster-table}
+first_tp <- calls %>% group_by(traj_id) %>% arrange(Age) %>% summarise(first_age = first(Age), first_source = first(source), first_AF = first(AF), .groups = "drop")
+sum_c <- sum_c %>% left_join(first_tp, by = "traj_id") %>%
+  mutate(crossed_2pct_during_fup = !is.na(Age_0.02) & Age_0.02 > first_age + 0.25, first_not_detected = first_source == "imputed",
+         cluster_label = cluster_factor(cluster, cl))
+cl_stats <- c(mean_VAF = "VAF (mean)", max_VAF = "VAF (max)", mean_VAF_speed = "VAF speed (mean)", max_VAF_speed = "VAF speed (max)",
+              mean_VAF_acceleration = "VAF acceleration (mean)", mean_Age = "Age (mean)", Time = "Follow-up time, years",
+              Age_LoD2 = "Age at LoD/2", Age_0.02 = "Age at 2% VAF")
+test_k <- function(x, g) kruskal.test(x ~ g)$p.value   # Kruskal-Wallis, as printed in Figure S7 (also when one cluster has no value)
+cl_tab <- map_dfr(names(cl_stats), function(s) {
+  d <- sum_c %>% filter(!is.na(.data[[s]]))
+  med <- d %>% group_by(cluster_label) %>% summarise(n = n(), median = median(.data[[s]]), .groups = "drop")
+  tibble(statistic = cl_stats[[s]], !!!setNames(as.list(sprintf("%s (n = %d)", signif(med$median, 3), med$n)), as.character(med$cluster_label)), p = test_k(d[[s]], d$cluster_label))
+})
+t2 <- table(sum_c$crossed_2pct_during_fup, sum_c$cluster_label)
+tg <- table(group_genes(sum_c$Gene.refGene), sum_c$cluster_label)
+share_row <- function(name, v) {
+  sh <- sum_c %>% group_by(cluster_label) %>% summarise(x = n_pct(.data[[v]]), .groups = "drop")
+  tibble(statistic = name, !!!setNames(as.list(sh$x), as.character(sh$cluster_label)), p = fisher.test(table(sum_c[[v]], sum_c$cluster_label))$p.value)
+}
+set.seed(2026)   # the Fisher test of the genes uses a simulated p value
+cl_tab <- bind_rows(cl_tab, share_row("crossed 2% VAF during follow-up, n (%)", "crossed_2pct_during_fup"), share_row("not detected at the first timepoint, n (%)", "first_not_detected"),
+                    tibble(statistic = "genes (Fisher)", p = fisher.test(tg, simulate.p.value = TRUE, B = 10000)$p.value))
+knitr::kable(cl_tab %>% mutate(p = signif(p, 2)))
+write_res(cl_tab, "fig2_cluster_statistics.txt")
+knitr::kable(tg, caption = "Genes by cluster")
+```
+
+# 5. Figure S7: statistics by cluster
+
+```{r figS-clusters, fig.width=13, fig.height=7}
+hl <- c(mean_VAF = chip_vaf, max_VAF = chip_vaf, mean_VAF_speed = 0, max_VAF_speed = 0, mean_VAF_acceleration = 0)
+p_s2 <- wrap_plots(imap(cl_stats, ~ cluster_box(sum_c, .y, .x, if (.y %in% names(hl)) hl[[.y]] else NULL, size = 13, clusters = cl) +
+                          theme(axis.text.x = element_text(size = 10))), ncol = 5) + plot_annotation(tag_levels = "a") & tag_theme
+save_supp(p_s2, "FigS7_clusters_statistics", 13, 7)
+p_s2
+```
+
+# 6. Figure S8: individuals with several trajectories, by cluster
+
+```{r figS-cooccurring-clusters, fig.width=11, fig.height=8}
+multi_ids <- calls %>% filter(N_CHIP > 1) %>% distinct(SHCS_ID_new) %>% mutate(num = as.integer(sub("SHCS_", "", SHCS_ID_new))) %>% arrange(num) %>% pull(SHCS_ID_new)
+pm <- pred %>% inner_join(cl %>% select(traj_id, cluster), by = "traj_id") %>% filter(SHCS_ID_new %in% multi_ids) %>%
+  mutate(SHCS_ID_new = factor(SHCS_ID_new, levels = multi_ids), cluster = cluster_factor(cluster, cl))
+om <- calls %>% filter(SHCS_ID_new %in% multi_ids) %>% inner_join(cl %>% select(traj_id, cluster), by = "traj_id") %>%
+  mutate(SHCS_ID_new = factor(SHCS_ID_new, levels = multi_ids), cluster = cluster_factor(cluster, cl))
+cols_k <- setNames(cluster_colors_k[seq_len(k_cl)], levels(pm$cluster))
+p_s3 <- ggplot() +
+  geom_line(data = pm, aes(x = Age, y = VAF, colour = cluster, group = traj_id), linewidth = 1) +
+  geom_point(data = om, aes(x = Age, y = AF, colour = cluster), size = 1.8) +
+  scale_colour_manual(values = cols_k, name = "Cluster") +
+  facet_wrap(~SHCS_ID_new, nrow = 4, ncol = 4, scales = "free") +
+  geom_hline(yintercept = chip_vaf, linewidth = 0.5, linetype = "dashed") +
+  scale_y_continuous(labels = percent) +
+  theme_classic(base_size = 14) + theme(strip.background = element_blank(), legend.position = "bottom") +
+  labs(y = "VAF (clone size)")
+save_supp(p_s3, "FigS8_cooccurring_by_cluster", 11, 8)
+p_s3
+```
+
+# 7. Figure 2 assembled
+
+```{r fig2, fig.width=16, fig.height=15}
+# three rows; the five gene panels share one row so that their plotting areas are identical
+hm2 <- hm + theme(text = element_text(size = 13), axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 10))
+row1 <- (p2a | p2b | p2c | p2d | p2e) + plot_layout(widths = rep(1, 5))
+row2 <- (hm2 | p_2g) + plot_layout(widths = c(1.15, 1))
+row3 <- (p2h | p2i | p2j) + plot_layout(widths = c(3, 1.05, 1))
+p_2 <- (row1 / row2 / row3) + plot_layout(heights = c(1, 1.7, 1.1)) + plot_annotation(tag_levels = "a") & tag_theme
+save_main(p_2, 2, "Figure2", 16, 15, svg = TRUE)
+p_2
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

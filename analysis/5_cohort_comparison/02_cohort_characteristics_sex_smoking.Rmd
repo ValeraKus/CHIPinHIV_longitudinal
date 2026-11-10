@@ -1,0 +1,176 @@
+---
+title: "SHCS vs SardiNIA: cohort characteristics, and the HIV effect adjusted for sex and smoking"
+author: "Valeriia Timonina"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+A side-by-side description of the two cohorts as analysed (Table S10),
+and the mixed model of log10 VAF on age and cohort with sex and smoking as
+covariates and within strata of sex.
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 9, fig.height = 5)
+```
+
+```{r libraries}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+source("R/Set_colors.R")
+out_res <- "results/paper/"
+out_fig <- "figures/paper/additional/"
+for (d in c(out_res, out_fig)) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+main_genes <- c("DNMT3A", "TET2", "ASXL1", "PPM1D", "TP53")
+```
+
+# Data
+
+```{r data}
+shcs <- read.table("resources/chip_calls_long_filtered.txt", sep = "\t", header = TRUE) %>%
+  as_tibble() %>%
+  transmute(Cohort = "SHCS", ID = as.character(ID), traj_id, Gene = Gene.refGene, Type = ExonicFunc.refGene, Age, AF,
+            source, lod_depth, lod_vaf, male = SEX == 1, ever_smoked = CV_SMOKED == 1)
+sard <- read.table("resources/LoD/sardinia_chip_calls_long_filtered.txt", sep = "\t", header = TRUE) %>%
+  as_tibble()
+smoke <- read.table("resources/SardiNIA/smoke.txt", sep = "\t", header = TRUE) %>%
+  group_by(SardID) %>%
+  summarise(ever_smoked = any(CurrentSmoker == "Y" | QuitSmoking == "Y" | (!is.na(PackYears) & PackYears > 0), na.rm = TRUE), .groups = "drop")
+sard <- sard %>%
+  left_join(smoke, by = "SardID") %>%
+  transmute(Cohort = "SardiNIA", ID = as.character(ID), traj_id, Gene = Gene.refGene, Type, Age = Age_exact,
+            AF, source, lod_depth, lod_vaf, male = Gender == "M", ever_smoked)
+both <- bind_rows(shcs, sard) %>% mutate(Cohort = factor(Cohort, levels = c("SardiNIA", "SHCS")))
+cat("Smoking known in SardiNIA for", n_distinct(sard$ID[!is.na(sard$ever_smoked)]), "of", n_distinct(sard$ID), "individuals\n")
+```
+
+# Table: the two cohorts as analysed
+
+```{r table}
+fmt_iqr <- function(x, d = 1) sprintf(paste0("%.", d, "f (%.", d, "f-%.", d, "f)"), median(x, na.rm = TRUE), quantile(x, 0.25, na.rm = TRUE), quantile(x, 0.75, na.rm = TRUE))
+fmt_pct <- function(x) sprintf("%d (%.0f%%)", sum(x, na.rm = TRUE), 100 * mean(x, na.rm = TRUE))
+
+per_ind <- both %>% group_by(Cohort, ID) %>%
+  summarise(male = first(male), ever_smoked = first(ever_smoked), n_traj = n_distinct(traj_id), n_samples = n_distinct(Age),
+            first_age = min(Age), last_age = max(Age), fup = max(Age) - min(Age), .groups = "drop")
+per_traj <- both %>% group_by(Cohort, traj_id, Gene) %>%
+  summarise(n_tp = n(), n_imputed = sum(source == "imputed"), max_af = max(AF), gap = median(diff(sort(unique(Age)))),
+            Type = first(Type), .groups = "drop") %>%
+  mutate(gene5 = ifelse(Gene %in% main_genes, Gene, "Other"),
+         missense = Type %in% c("nonsynonymous SNV", "nonsynonymous_SNV"))
+
+row <- function(name, f) tibble(Characteristic = name, SHCS = f("SHCS"), SardiNIA = f("SardiNIA"))
+tab <- bind_rows(
+  row("Individuals", function(c) as.character(n_distinct(per_ind$ID[per_ind$Cohort == c]))),
+  row("Trajectories", function(c) as.character(sum(per_traj$Cohort == c))),
+  row("Trajectories in the 5 main genes", function(c) as.character(sum(per_traj$Cohort == c & per_traj$Gene %in% main_genes))),
+  row("Male sex, n (%)", function(c) fmt_pct(per_ind$male[per_ind$Cohort == c])),
+  row("Ever smoked, n (%) of those with data", function(c) fmt_pct(per_ind$ever_smoked[per_ind$Cohort == c])),
+  row("Individuals with smoking data", function(c) as.character(sum(!is.na(per_ind$ever_smoked[per_ind$Cohort == c])))),
+  row("Age at first sample, years, median (IQR)", function(c) fmt_iqr(per_ind$first_age[per_ind$Cohort == c])),
+  row("Age at last sample, years, median (IQR)", function(c) fmt_iqr(per_ind$last_age[per_ind$Cohort == c])),
+  row("Follow-up per individual, years, median (IQR)", function(c) fmt_iqr(per_ind$fup[per_ind$Cohort == c])),
+  row("Samples per individual, median (IQR)", function(c) fmt_iqr(per_ind$n_samples[per_ind$Cohort == c], 0)),
+  row("Timepoints per trajectory, median (IQR)", function(c) fmt_iqr(per_traj$n_tp[per_traj$Cohort == c], 0)),
+  row("Interval between timepoints, years, median (IQR)", function(c) fmt_iqr(per_traj$gap[per_traj$Cohort == c])),
+  row("Depth at the variant, median (IQR)", function(c) fmt_iqr(both$lod_depth[both$Cohort == c], 0)),
+  row("Limit of detection, % VAF, median (IQR)", function(c) fmt_iqr(100 * both$lod_vaf[both$Cohort == c], 2)),
+  row("Timepoints not detected (imputed at LoD/2), n (%)", function(c) fmt_pct(both$source[both$Cohort == c] == "imputed")),
+  row("Maximum VAF per trajectory, %, median (IQR)", function(c) fmt_iqr(100 * per_traj$max_af[per_traj$Cohort == c])),
+  row("DNMT3A, n (%)", function(c) fmt_pct(per_traj$gene5[per_traj$Cohort == c] == "DNMT3A")),
+  row("TET2, n (%)", function(c) fmt_pct(per_traj$gene5[per_traj$Cohort == c] == "TET2")),
+  row("ASXL1, n (%)", function(c) fmt_pct(per_traj$gene5[per_traj$Cohort == c] == "ASXL1")),
+  row("PPM1D, n (%)", function(c) fmt_pct(per_traj$gene5[per_traj$Cohort == c] == "PPM1D")),
+  row("TP53, n (%)", function(c) fmt_pct(per_traj$gene5[per_traj$Cohort == c] == "TP53")),
+  row("Other genes, n (%)", function(c) fmt_pct(per_traj$gene5[per_traj$Cohort == c] == "Other")),
+  row("Missense variants, n (%)", function(c) fmt_pct(per_traj$missense[per_traj$Cohort == c])))
+knitr::kable(tab)
+write.table(tab, paste0(out_res, "cohort_characteristics_SHCS_SardiNIA.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+
+tests <- tibble(
+  Characteristic = c("Male sex", "Ever smoked", "Age at first sample", "Follow-up", "Interval between timepoints", "Depth", "LoD", "Maximum VAF"),
+  p = c(fisher.test(table(per_ind$Cohort, per_ind$male))$p.value,
+        fisher.test(table(per_ind$Cohort, per_ind$ever_smoked))$p.value,
+        wilcox.test(first_age ~ Cohort, per_ind)$p.value, wilcox.test(fup ~ Cohort, per_ind)$p.value,
+        wilcox.test(gap ~ Cohort, per_traj)$p.value, wilcox.test(lod_depth ~ Cohort, both)$p.value,
+        wilcox.test(lod_vaf ~ Cohort, both)$p.value, wilcox.test(max_af ~ Cohort, per_traj)$p.value))
+knitr::kable(tests %>% mutate(p = signif(p, 2)))
+```
+
+# Mixed models with sex and smoking
+
+Model of the cohort comparison (Figure 4): log10(VAF) ~ age (centred at 65) + cohort, random intercept and slope per
+trajectory, on the measured timepoints of the unmatched and the matched age-filtered sets of the 5 main genes.
+Here the same model is fitted with sex, with sex and smoking (complete cases), and within each sex.
+
+```{r models}
+read_set <- function(name) read.table(sprintf("resources/LoD/SHCS_Sardinia_%s_trajectories.txt", name), sep = "\t", header = TRUE) %>%
+  as_tibble() %>%
+  filter(data_point == 1) %>%
+  mutate(ID = as.character(ID), Cohort = factor(Cohort, levels = c("Sardinia", "SHCS")), Age_c = Age - 65) %>%
+  left_join(per_ind %>% select(ID, male, ever_smoked), by = "ID")
+sets <- list(unmatched = read_set("unmatched"), matched_age_filtered = read_set("matched_age_filtered"))
+
+fit_one <- function(d, formula, label, set) {
+  m <- lmer(formula, data = d, control = lmerControl(optimizer = "bobyqa"))
+  tidy(m, effects = "fixed", conf.int = TRUE) %>%
+    transmute(set, model = label, term, estimate, conf.low, conf.high, p.value, n_traj = n_distinct(d$traj_id), n_meas = nrow(d),
+              converged = is.null(m@optinfo$conv$lme4$messages))
+}
+res <- map_dfr(names(sets), function(s) {
+  d <- sets[[s]]
+  bind_rows(
+    fit_one(d, log10(VAF) ~ Age_c + Cohort + (Age_c | traj_id), "age + cohort", s),
+    fit_one(d, log10(VAF) ~ Age_c + Cohort + male + (Age_c | traj_id), "age + cohort + sex", s),
+    fit_one(filter(d, !is.na(ever_smoked)), log10(VAF) ~ Age_c + Cohort + male + ever_smoked + (Age_c | traj_id), "age + cohort + sex + smoking (complete cases)", s),
+    fit_one(filter(d, male), log10(VAF) ~ Age_c + Cohort + (Age_c | traj_id), "men only", s),
+    fit_one(filter(d, !male), log10(VAF) ~ Age_c + Cohort + (Age_c | traj_id), "women only", s),
+    fit_one(d, log10(VAF) ~ Age_c * Cohort + male + (Age_c | traj_id), "age x cohort + sex", s))
+})
+res %>% filter(term != "(Intercept)") %>% mutate(across(c(estimate, conf.low, conf.high), ~ round(.x, 3)), p.value = signif(p.value, 2)) %>% knitr::kable()
+write.table(res, paste0(out_res, "mixed_models_sex_smoking.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+```{r forest, fig.width=8, fig.height=4.5}
+fp <- res %>% filter(term == "CohortSHCS") %>%
+  mutate(model = factor(model, levels = rev(unique(model))), set = factor(set, levels = c("unmatched", "matched_age_filtered"), labels = c("Unmatched", "Matched, age-filtered")))
+p <- ggplot(fp, aes(y = model, x = estimate, xmin = conf.low, xmax = conf.high)) +
+  geom_vline(xintercept = 0, color = "grey50") +
+  geom_pointrange(color = "red3") +
+  facet_wrap(~set) +
+  labs(x = "HIV effect on log10 VAF (95% CI)", y = NULL) +
+  theme_bw(base_size = 11) + theme(strip.background = element_blank())
+p
+ggsave(paste0(out_fig, "HIV_effect_sex_smoking_forest.png"), p, width = 8, height = 4.5, dpi = 200)
+```
+
+# Age at 2% VAF by sex
+
+```{r age2}
+ages <- bind_rows(read.table("resources/LoD/SHCS_trajectories_threshold_ages.txt", sep = "\t", header = TRUE) %>% mutate(Cohort = "SHCS"),
+                  read.table("resources/LoD/Sardinia_trajectories_threshold_ages.txt", sep = "\t", header = TRUE) %>% mutate(Cohort = "SardiNIA")) %>%
+  left_join(per_traj %>% select(traj_id, Gene), by = "traj_id") %>%
+  mutate(ID = sub(":.*", "", traj_id)) %>%
+  left_join(per_ind %>% select(ID, male), by = "ID") %>%
+  filter(Gene %in% main_genes, !is.na(Age_0.02))
+age_tab <- ages %>% group_by(sex = ifelse(male, "men", "women"), Cohort) %>%
+  summarise(n = n(), median_Age_0.02 = median(Age_0.02), .groups = "drop") %>%
+  pivot_wider(names_from = Cohort, values_from = c(n, median_Age_0.02))
+age_p <- ages %>% group_by(sex = ifelse(male, "men", "women")) %>% summarise(p = wilcox.test(Age_0.02 ~ Cohort)$p.value)
+age_tab <- left_join(age_tab, age_p, by = "sex")
+knitr::kable(age_tab)
+write.table(age_tab, paste0(out_res, "age_at_2pct_by_sex.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+summary(lm(Age_0.02 ~ Cohort + male, data = ages))$coefficients
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

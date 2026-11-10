@@ -1,0 +1,231 @@
+---
+title: "Figure 1 and Figure S1 (trajectories with the limit of detection)"
+author: "Valeriia Timonina"
+date: "2026-11-05"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+Figure 1 (study design, one example trajectory with the REML spline, its uncertainty and the
+limit of detection, number of variants per individual, variants by gene and type) and Figure S1 (all 71 trajectories,
+one panel each, with the limit of detection of every timepoint). The trajectories are the final set
+(longitudinal assay only, per-timepoint LoD, not detected timepoints at LoD / 2; `resources/chip_calls_long_filtered.txt`),
+the curves the REML splines of `resources/LoD/`. Participant ids are the new ids of the paper.
+
+```{r libraries}
+source("R/paper_functions.R")
+library(gratia)
+library(png)
+library(grid)
+
+calls <- load_calls()
+pred  <- load_pred()
+pred2 <- load_pred2()
+sum_  <- load_sum()
+ages  <- load_ages()
+ids   <- load_ids()
+n_draws <- 1000
+```
+
+# 1. Numbers for the text
+
+```{r numbers}
+numbers <- tibble(
+  individuals = n_distinct(calls$ID), trajectories = n_distinct(calls$traj_id), measurements = nrow(calls),
+  `Mutect2 calls` = sum(calls$source == "original"), `pile-up rescues` = sum(calls$source == "bam_readcount"),
+  `not detected (LoD/2)` = sum(calls$source == "imputed"),
+  `median depth (IQR)` = iqr_txt(calls$lod_depth, 0),   # all 374 measurements, as in Table S10
+  `median LoD, % VAF (IQR)` = iqr_txt(100 * calls$lod_vaf, 2),
+  `max LoD, % VAF` = sprintf("%.2f", 100 * max(calls$lod_vaf)),
+  `timepoints per trajectory, median (IQR)` = iqr_txt(count(calls, traj_id)$n, 0),
+  `first age, median (IQR)` = iqr_txt((calls %>% group_by(ID) %>% summarise(a = min(Age)))$a, 1),
+  `follow-up per individual, years, median (IQR)` = iqr_txt((calls %>% group_by(ID) %>% summarise(a = max(Age) - min(Age)))$a, 1))
+knitr::kable(t(numbers))
+write_res(as.data.frame(t(numbers)) %>% rownames_to_column("item") %>% setNames(c("item", "value")), "figure1_numbers.txt")
+
+ind <- calls %>% distinct(ID, N_CHIP)
+knitr::kable(ind %>% count(N_CHIP) %>% mutate(share = sprintf("%.0f%%", 100 * n / sum(n))), caption = "Variants per individual")
+genes <- calls %>% distinct(traj_id, Gene = group_genes(Gene.refGene), ExonicFunc.refGene)
+knitr::kable(genes %>% count(Gene) %>% mutate(share = sprintf("%.0f%%", 100 * n / sum(n))), caption = "Trajectories by gene")
+knitr::kable(genes %>% count(ExonicFunc.refGene) %>% arrange(-n) %>% mutate(share = sprintf("%.0f%%", 100 * n / sum(n))), caption = "Trajectories by type")
+```
+
+# 2. Figure 1b: one trajectory with the REML spline, its uncertainty and the LoD
+
+The panel shows a hypothetical trajectory of five measurements, fitted with the REML spline of the main analysis, with
+the LoD and the extrapolation back to LoD/2. The band around the curve is the 95% interval of the REML fit; speed and
+acceleration (orange, red) are the finite differences of the curve over half a year, with 95% intervals from
+`r n_draws` draws of the spline coefficients.
+
+```{r fig1b, fig.width=7, fig.height=5}
+# A hypothetical trajectory, fitted with the REML spline of the main analysis
+obs <- tibble(Age = c(55, 60, 65, 70, 75), AF = c(0.06, 0.10, 0.08, 0.12, 0.20), lod_vaf = 0.003)
+fit <- fit_traj(obs$Age, obs$AF, spec_main)
+lod2 <- obs$lod_vaf[1] / 2
+grid_age <- seq(min(obs$Age), max(obs$Age), by = 0.1)
+fs <- fitted_samples(fit$model, n = n_draws, data = data.frame(Age = c(grid_age, grid_age + step)), seed = 1) %>% arrange(.draw, .row)
+n <- length(grid_age)
+m <- matrix(fs$.fitted, nrow = 2 * n)
+vaf_d <- pmax(m[1:n, , drop = FALSE], lod2)
+speed_d <- (m[(n + 1):(2 * n), , drop = FALSE] - m[1:n, , drop = FALSE]) / step
+acc_d <- (speed_d - rbind(speed_d[1, , drop = FALSE], speed_d[-n, , drop = FALSE])) / step   # backward difference of the speed
+acc_d[1, ] <- NA
+band <- function(x, name) tibble(Age = grid_age, curve = name, mean = rowMeans(x), lo = apply(x, 1, quantile, 0.025, na.rm = TRUE), hi = apply(x, 1, quantile, 0.975, na.rm = TRUE))
+curve_main <- tibble(Age = grid_age, VAF = pmax(fit$predict(grid_age), lod2))
+bands <- bind_rows(band(vaf_d, "VAF"), band(speed_d, "VAF speed"), band(acc_d, "VAF acceleration"))
+# summary statistics on the half-year grid, as in the main analysis
+g05 <- seq(min(obs$Age), max(obs$Age), by = 0.5)
+v05 <- pmax(fit$predict(g05), lod2); s05 <- diff(v05) / 0.5; a05 <- diff(s05) / 0.5
+stats <- list(max_VAF_speed = max(s05), mean_VAF_speed = mean(s05), min_VAF_speed = min(s05), sd_VAF_speed = sd(s05),
+              max_VAF_acceleration = max(a05), mean_VAF_acceleration = mean(a05), min_VAF_acceleration = min(a05), sd_VAF_acceleration = sd(a05))
+# extrapolation back in time to LoD/2 and the two threshold ages
+ext_age <- seq(min(obs$Age) - 30, min(obs$Age), by = 0.1)
+extrap <- tibble(Age = ext_age, VAF = fit$predict(ext_age)) %>% filter(VAF >= lod2)
+all_curve <- bind_rows(extrap, curve_main) %>% arrange(Age)
+age2 <- list(Age_LoD2 = min(extrap$Age), Age_0.02 = all_curve$Age[which(all_curve$VAF >= chip_vaf)[1]])
+
+sec <- max(curve_main$VAF) / max(abs(c(bands$lo[bands$curve != "VAF"], bands$hi[bands$curve != "VAF"])), na.rm = TRUE)
+deriv_colors <- c("VAF speed" = "#E69F00", "VAF acceleration" = "#B2182B")
+lab_txt <- sprintf("max = %.4f\nmean = %.4f\nmin = %.4f\nSD = %.4f", c(stats$max_VAF_speed, stats$max_VAF_acceleration), c(stats$mean_VAF_speed, stats$mean_VAF_acceleration),
+                   c(stats$min_VAF_speed, stats$min_VAF_acceleration), c(stats$sd_VAF_speed, stats$sd_VAF_acceleration))
+x_min <- min(c(extrap$Age, obs$Age)) - 1
+p_1b <- ggplot() +
+  geom_ribbon(data = filter(bands, curve == "VAF"), aes(x = Age, ymin = lo, ymax = hi), fill = "grey75", alpha = 0.5) +
+  geom_ribbon(data = filter(bands, curve != "VAF"), aes(x = Age, ymin = lo * sec, ymax = hi * sec, fill = curve), alpha = 0.18) +
+  geom_line(data = extrap, aes(x = Age, y = VAF), colour = "grey40", linewidth = 1.2, linetype = "dashed") +
+  geom_line(data = curve_main, aes(x = Age, y = VAF), colour = "grey35", linewidth = 1.6) +
+  geom_line(data = filter(bands, curve != "VAF"), aes(x = Age, y = mean * sec, colour = curve), linewidth = 1.3) +
+  geom_line(data = obs, aes(x = Age, y = lod_vaf, linetype = "LoD of the timepoint"), colour = "black", linewidth = 0.5) +
+  geom_hline(yintercept = 0, colour = "#E69F00", linetype = "dotted", linewidth = 0.5) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed", linewidth = 0.4) +
+  geom_point(data = obs, aes(x = Age, y = AF), size = 3, colour = "black") +
+  annotate("point", x = age2$Age_0.02, y = chip_vaf, shape = 23, size = 3.8, fill = "white", colour = "grey20") +
+  annotate("text", x = age2$Age_0.02, y = chip_vaf, label = "age at 2% VAF", vjust = -1.1, hjust = 0.1, size = 3.8) +
+  annotate("point", x = age2$Age_LoD2, y = lod2, shape = 23, size = 3.8, fill = "white", colour = "grey20") +
+  annotate("text", x = age2$Age_LoD2, y = lod2, label = "age at LoD/2 (detectable onset)", vjust = 1.8, hjust = 0.1, size = 3.8) +
+  annotate("text", x = x_min, y = max(curve_main$VAF) * 1.0, label = lab_txt[1], colour = deriv_colors[1], hjust = 0, vjust = 1, size = 4) +
+  annotate("text", x = x_min + 0.3 * (max(obs$Age) - x_min), y = max(curve_main$VAF) * 1.0, label = lab_txt[2], colour = deriv_colors[2], hjust = 0, vjust = 1, size = 4) +
+  scale_y_continuous(name = "VAF", sec.axis = sec_axis(~ . / sec, name = "VAF speed | acceleration"), expand = expansion(mult = c(0.03, 0.08))) +
+  scale_colour_manual(values = deriv_colors, name = NULL, guide = guide_legend(order = 2)) +
+  scale_fill_manual(values = deriv_colors, guide = "none") +
+  scale_linetype_manual(values = c("LoD of the timepoint" = "dotted"), name = NULL, guide = guide_legend(order = 1)) +
+  labs(x = "Age") +
+  theme_classic(base_size = 15) +
+  theme(axis.title.y.right = element_text(colour = "#E69F00"), axis.text.y.right = element_text(colour = "#E69F00"),
+        legend.position = "bottom", legend.box = "vertical", legend.spacing.y = unit(0, "pt"), legend.margin = margin(0, 0, 0, 0),
+        legend.text = element_text(size = 11))
+p_1b
+save_panel(p_1b, 1, "Fig1b_hypothetical_trajectory_REML", 7, 5.5)
+```
+
+# 3. Figure 1c and 1d: variants per individual, variants by gene and type
+
+```{r fig1cd, fig.width=11, fig.height=4}
+mut_levels <- c("splicing", "frameshift insertion", "frameshift deletion", "stopgain", "nonsynonymous SNV")
+traj_variants <- calls %>%
+  filter(!is.na(ExonicFunc.refGene)) %>%
+  distinct(ID, Gene.refGene, traj_id, ExonicFunc.refGene) %>%
+  mutate(Gene.refGene = ifelse(Gene.refGene %in% other_genes, "Other", Gene.refGene),
+         Gene.refGene = factor(Gene.refGene, levels = c("DNMT3A", "TET2", "ASXL1", "TP53", "PPM1D", "Other")),
+         type = recode(ExonicFunc.refGene, "nonsynonymous SNV" = "missense", "stopgain" = "nonsense"),
+         type = factor(type, levels = c("splicing", "frameshift insertion", "frameshift deletion", "nonsense", "missense")))
+stopifnot(!anyDuplicated(traj_variants$traj_id), all(traj_variants$ExonicFunc.refGene %in% mut_levels))
+count_axis <- function(N) {
+  top <- max(30, 5 * ceiling(max(N) / 5))
+  scale_y_continuous(name = "Count", breaks = seq(0, top, 5), limits = c(0, top))
+}
+gene_mut_counts <- traj_variants %>% count(Gene.refGene, type, name = "N")
+p_1d <- ggplot(gene_mut_counts, aes(x = Gene.refGene, y = N, fill = type, label = N)) +
+  geom_col(color = "black") +
+  count_axis(traj_variants %>% count(Gene.refGene) %>% pull(n)) +
+  xlab("") +
+  geom_text(size = 3.5, position = position_stack(vjust = 0.5)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(size = 17, angle = 45, hjust = 1, face = "italic"), axis.title.y = element_text(size = 14),
+        axis.text.y = element_text(size = 17)) +
+  guides(fill = guide_legend(title = "Mutation type"))
+p_1c <- calls %>% distinct(ID, N_CHIP) %>%
+  ggplot(aes(x = N_CHIP)) +
+  geom_bar(color = "black", fill = "grey", linewidth = 0.8) +
+  theme_classic() +
+  scale_y_continuous(name = "Count", breaks = seq(0, 40, 10), limits = c(0, 40)) +
+  xlab("Number of CHIP variants per individual") +
+  theme(axis.text = element_text(size = 17), axis.title = element_text(size = 16))
+save_panel(p_1c, 1, "Fig1c_num_chip", 5, 4)
+save_panel(p_1d, 1, "Fig1d_gene_mut_distr", 6, 4)
+p_1c | p_1d
+```
+
+# 4. Figure 1 assembled
+
+Panel a is the drawn study scheme (`assets/Study_scheme.png`).
+
+```{r fig1, fig.width=13, fig.height=13}
+scheme <- readPNG("assets/Study_scheme.png")
+# crop the white margins of the scheme
+ink <- if (dim(scheme)[3] == 4) scheme[, , 4] > 0.05 else (scheme[, , 1] < 0.97 | scheme[, , 2] < 0.97 | scheme[, , 3] < 0.97)
+rows <- range(which(rowMeans(ink) > 0.002)); cols <- range(which(colMeans(ink) > 0.002))   # stray pixels are ignored
+scheme <- scheme[rows[1]:rows[2], cols[1]:cols[2], ]
+cat("scheme aspect (width / height):", ncol(scheme) / nrow(scheme), "\n")
+p_1a <- wrap_elements(full = rasterGrob(scheme, interpolate = TRUE))   # fits the cell, keeps the aspect ratio
+layout <- "
+AAAAAA
+AAAAAA
+BBBBCC
+BBBBCC
+BBBBDD
+BBBBDD
+"
+# c over d as one block, so that the tall gene labels of d do not stretch the axis-title row of b
+right <- wrap_elements(full = (p_1c / p_1d) + plot_annotation(tag_levels = list(c("c", "d"))) & tag_theme)
+bottom <- ((p_1b + theme(legend.position = "bottom", legend.box = "horizontal")) | right) + plot_layout(widths = c(1.1, 1))
+p_1 <- (p_1a / bottom) + plot_layout(heights = c(1, 1.45)) + plot_annotation(tag_levels = list(c("a", "b", ""))) & tag_theme
+save_main(p_1, 1, "Figure1", 13, 11.5, svg = TRUE)
+p_1
+```
+
+# 5. Figure S1: all trajectories with the limit of detection
+
+One panel per trajectory (new participant id, gene and protein change), ordered by participant. Points: measured VAF
+(filled circle: Mutect2 call; triangle: variant reads in the read pile-up at a timepoint without a call; open circle:
+no variant read, set to half the LoD of the timepoint). Dotted black line: the LoD of each timepoint, from its depth at
+the variant. Coloured line: the REML spline (floored at half the trajectory's mean LoD). Dashed line: 2% VAF. Log scale.
+
+```{r figS1, fig.width=16, fig.height=19}
+panel_levels <- calls %>% distinct(SHCS_ID_new, traj_id, label, Gene.refGene) %>%
+  mutate(num = as.integer(sub("SHCS_", "", SHCS_ID_new)), panel = paste(SHCS_ID_new, label)) %>%
+  arrange(num, Gene.refGene, label) %>% pull(panel)
+obs_s1 <- calls %>% mutate(panel = factor(paste(SHCS_ID_new, label), levels = panel_levels), Gene = group_genes(Gene.refGene))
+curve_s1 <- pred %>% inner_join(calls %>% distinct(traj_id, label), by = "traj_id") %>%
+  mutate(panel = factor(paste(SHCS_ID_new, label), levels = panel_levels), Gene = group_genes(Gene.refGene))
+p_s1 <- ggplot() +
+  geom_line(data = curve_s1, aes(x = Age, y = VAF, colour = Gene), linewidth = 0.7) +
+  geom_line(data = obs_s1, aes(x = Age, y = lod_vaf, linetype = "LoD of the timepoint"), colour = "black", linewidth = 0.45) +
+  geom_point(data = obs_s1, aes(x = Age, y = AF, colour = Gene, shape = source), size = 1.8) +
+  geom_hline(yintercept = chip_vaf, linewidth = 0.4, linetype = "dashed") +
+  scale_y_log10(breaks = c(0.001, 0.01, 0.1), labels = c("0.1%", "1%", "10%"), limits = c(5e-4, 0.55)) +
+  scale_colour_manual(values = gene_colors, name = "CHIP gene", guide = guide_legend(order = 3)) +
+  scale_shape_manual(values = source_shapes, labels = source_labels, name = NULL, guide = guide_legend(order = 2)) +
+  scale_linetype_manual(values = c("LoD of the timepoint" = "dotted"), name = NULL, guide = guide_legend(order = 1)) +
+  facet_wrap(~panel, ncol = 8, scales = "free_x") +
+  labs(x = "Age", y = "VAF") +
+  theme_classic(base_size = 11) +
+  theme(strip.text = element_text(size = 8.5), strip.background = element_blank(), legend.position = "bottom",
+        legend.text = element_text(size = 11))
+save_supp(p_s1, "FigS1_all_trajectories_LoD", 16, 19)
+p_s1
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

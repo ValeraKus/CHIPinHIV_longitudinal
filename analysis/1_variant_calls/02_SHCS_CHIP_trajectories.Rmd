@@ -1,0 +1,1694 @@
+---
+title: "SHCS CHIP trajectories: Mutect2 calls, limit of detection and trajectory filtering"
+author: "Valeriia Timonina"
+date: "2026-10-20"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 5)
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+library(ggpubr)
+library(scales)
+```
+
+```{r colors}
+source("R/Set_colors.R")
+```
+
+The SHCS CHIP trajectories are built from the Mutect2 calls of the longitudinal sequencing
+(`resources/chip_calls.csv`), with the calls of the earlier cross-sectional CHIP screening if `use_cross` is
+`TRUE` (Parameters). Every measurement gets
+a limit of detection (LoD) from the `chip_lod` package, the trajectories are filtered on VAF and LoD, extended
+with timepoints from the bam-readcount pileup, and the timepoints at which a variant is not detected get a VAF of
+half the LoD of the timepoint.
+
+| Section | Step |
+|---|---|
+| 1 | Data; removal of the individuals without a CHIP call and of the samples with DNA from another person |
+| 2 | LoD of all Mutect2 CHIP calls |
+| 3 | Unfiltered trajectories |
+| 4 | Calls of the cross-sectional CHIP screening (added to the trajectories only with `use_cross`) |
+| 5 | Filter: >= 1 timepoint with VAF >= 2% and >= `min_tp_above_lod` timepoints with VAF >= LoD |
+| 6 | Timepoints added from bam-readcount |
+| 7 | Filter: >= 2 detected timepoints, >= 1 of them with VAF >= 2% |
+| 8 | LoD per trajectory; VAF of the not detected timepoints |
+| 9 | Counts after each step |
+| 10 | Final table |
+| 11 | Plots and tables |
+
+Terms used throughout:
+
+- **call**: one record of a CHIP variant in one sample, from Mutect2 (longitudinal sequencing) or from the
+  cross-sectional screening.
+- **trajectory**: one variant in one individual (`traj_id` = `ID:Variant`).
+- **timepoint**: one sequenced sample of an individual. Every longitudinal sample of an individual is a timepoint
+  of each of its trajectories; with `use_cross`, the cross-sectional sample is a timepoint of the trajectories
+  called in it.
+- **detected / not detected**: the variant has a measured VAF at this timepoint (a call, or bam-readcount from
+  section 6 on) / the longitudinal sample was sequenced but the variant has no measured VAF.
+
+The notebook writes the final table and the two intermediate tables to `resources/` (section 10), and the
+figures and tables of section 11 to `figures/`, `results/` and `output/` (`paper_dir`:
+`Figure1/`, `Tables/`, `Supplementary_Figures/`).
+
+
+# Parameters
+
+```{r parameters}
+chip_vaf     <- 0.02              # CHIP VAF threshold
+excluded_ids <- scan("resources/excluded_individuals.txt", quiet = TRUE)   # individuals with inconsistent CHIP data (no CHIP call), removed
+
+# chip_lod (package defaults, as in 01_per_sample_LoD_and_QC.Rmd)
+err_rate  <- 0.001                # per-base sequencing error rate e
+alpha     <- 0.05                 # per-site false-positive rate used for k*
+power_tgt <- 0.95                 # detection probability that defines the LoD
+
+use_cross        <- FALSE         # section 4: TRUE adds the calls of the cross-sectional screening to the trajectories
+min_tp_above_lod <- 1             # section 5: calls with VAF >= LoD a trajectory needs (1 or 2)
+min_alt_reads    <- 1             # section 6: reads of the variant allele that make a bam-readcount timepoint
+min_timepoints   <- 2             # section 7: detected timepoints a trajectory needs
+impute_fraction  <- 0.5           # section 8: VAF of a not detected timepoint = impute_fraction x LoD of the timepoint
+
+# One sample is in the pileup twice, under two suffixed names (01_per_sample_LoD_and_QC.Rmd, section 3.1: the two
+# runs hold the same reads). resources/pileup_sample_names.txt lists the run to use and the run to drop
+# (tab-separated: pileup_name, action = use / drop, sample)
+pileup_names <- read.delim("resources/pileup_sample_names.txt", colClasses = "character")
+pileup_sample_alias <- with(subset(pileup_names, action == "use"), setNames(sample, pileup_name))
+pileup_sample_drop  <- subset(pileup_names, action == "drop")$pileup_name
+
+paper_dir <- "output"   # sections 11.4-11.6 write here (Tables/, Supplementary_Figures/)
+                                                    # the plots of sections 11.1-11.3 use the same folder (Figure1/)
+for (d in c("results", "figures", file.path(paper_dir, c("Figure1", "Tables", "Supplementary_Figures")))) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+
+stopifnot(is.logical(use_cross), min_tp_above_lod %in% 1:2, min_alt_reads >= 1, impute_fraction > 0)
+
+status_levels <- c("VAF >= LoD", "called, VAF < LoD", "not called (k < k*)")
+status_colors <- setNames(c("#2a78d6", "#E69F00", "#898781"), status_levels)
+shape_status  <- c("Mutect2, VAF >= LoD" = 16, "Mutect2, VAF < LoD" = 17, "not detected" = 4)
+shape_cross   <- c("Mutect2" = 16, "cross-sectional" = 15, "not detected" = 4)
+shape_source  <- c("Mutect2" = 16, "cross-sectional" = 15, "bam-readcount" = 17, "not detected" = 4)
+shape_imputed <- c("Mutect2" = 16, "cross-sectional" = 15, "bam-readcount" = 17, "imputed" = 1)
+
+# without the cross-sectional calls their shape is left out of the legends
+if (!use_cross) {
+  shape_cross   <- shape_cross[names(shape_cross) != "cross-sectional"]
+  shape_source  <- shape_source[names(shape_source) != "cross-sectional"]
+  shape_imputed <- shape_imputed[names(shape_imputed) != "cross-sectional"]
+}
+
+med_iqr <- function(x, digits = 0, scale = 1) {
+  if (all(is.na(x))) return("-")
+  q <- quantile(x * scale, c(0.5, 0.25, 0.75), na.rm = TRUE)
+  sprintf("%.*f (%.*f-%.*f)", digits, q[1], digits, q[2], digits, q[3])
+}
+n_pct <- function(x) sprintf("%d (%.1f%%)", sum(x), 100 * mean(x))
+```
+
+Two helpers are used in every section: `record_step()` reports the counts left after a step (and keeps them for
+section 9), `plot_traj()` draws one panel per individual.
+
+```{r helpers}
+step_counts <- tibble()
+
+# obs: one row per trajectory and timepoint, `detected` marks a measured VAF
+record_step <- function(step, obs) {
+  row <- obs %>%
+    summarise(individuals = n_distinct(ID),
+              `samples (timepoints)` = n_distinct(Sample),
+              `samples with a detected variant` = n_distinct(Sample[detected]),
+              trajectories = n_distinct(traj_id),
+              `detected timepoints` = sum(detected),
+              `not detected timepoints` = sum(!detected)) %>%
+    mutate(step = step, .before = 1)
+  step_counts <<- bind_rows(step_counts, row)
+  knitr::kable(row)
+}
+
+# y = AF_plot; not detected timepoints are drawn at 0 on the linear scale
+plot_traj <- function(df, shape_by, shapes, title = NULL, y_log = FALSE) {
+  p <- ggplot(df, aes(x = Age, y = AF_plot, color = Gene.refGene, group = traj_id)) +
+    geom_line(linewidth = 0.5) +
+    geom_point(aes(shape = .data[[shape_by]]), size = 1.7) +
+    geom_hline(yintercept = chip_vaf, linewidth = 0.4, linetype = "dashed") +
+    scale_color_manual(values = gene_colors) +
+    scale_shape_manual(values = shapes, limits = names(shapes)) +
+    facet_wrap(~ID, nrow = 7, ncol = 9) +
+    labs(y = "VAF", color = "CHIP gene", shape = NULL, title = title) +
+    theme_classic()
+  if (y_log) p <- p + scale_y_log10(labels = percent)
+  p
+}
+```
+
+
+# 1. Data
+
+## 1.1 Sequenced samples
+
+A longitudinal sample was sequenced if it has a Mutect2 VCF (`resources/mutect2_Calls/mutect2_output`). Removed:
+
+- individuals with a single sample (not part of the longitudinal study);
+- the individuals who have no CHIP call (`resources/excluded_individuals.txt`);
+- the samples with DNA from another person (`mixed == TRUE` in `resources/SHCS_sample_contamination_QC.txt`,
+  written by `01_per_sample_LoD_and_QC.Rmd`, section 3.3). In such a sample the real clones are diluted and
+  the other person's variants look like low-VAF calls, so neither its calls nor its "not detected" timepoints
+  are used.
+
+```{r samples}
+vcf_samples <- sub(".vcf.gz$", "", list.files("resources/mutect2_Calls/mutect2_output", pattern = "vcf.gz$"))
+
+sample_qc     <- read.table("resources/SHCS_sample_contamination_QC.txt", sep = "\t", header = TRUE)
+mixed_samples <- sample_qc$S_ID[sample_qc$mixed]
+
+samples_all <- read.csv("resources/samples_with_dates.csv") %>%
+  transmute(Sample  = ID,
+            ID      = as.numeric(gsub("ID SHCS ", "", Subject.Id)),
+            LABDATE = as.Date(gsub(" 00:00:00", "", Collection), format = "%d/%m/%Y")) %>%
+  group_by(ID) %>%
+  mutate(longitudinal = n() > 1) %>%
+  ungroup() %>%
+  mutate(sequenced   = Sample %in% vcf_samples,
+         excluded_id = ID %in% excluded_ids,
+         mixed       = Sample %in% mixed_samples)
+stopifnot(all(vcf_samples %in% samples_all$Sample))
+
+samples_all %>%
+  mutate(group = case_when(!longitudinal ~ "removed: individual with a single sample",
+                           excluded_id   ~ "removed: individual without a CHIP call",
+                           !sequenced    ~ "no Mutect2 VCF",
+                           mixed         ~ "removed: DNA from another person",
+                           TRUE          ~ "kept")) %>%
+  group_by(group) %>%
+  summarise(samples = n(), `with a Mutect2 VCF` = sum(sequenced), individuals = n_distinct(ID)) %>%
+  knitr::kable()
+
+sample_qc %>%
+  filter(mixed) %>%
+  select(ID, S_ID, LABDATE, hom_sites, foreign_read_share, mixed_sample_min) %>%
+  knitr::kable(caption = "Samples with DNA from another person")
+```
+
+Demographics from the SHCS database (December 2024). Age at a timepoint is the collection year minus the birth
+year.
+
+```{r seq-samples}
+pat <- read.csv("resources/SHCS_database/2024-12/pat.csv") %>%
+  select(ID, BORN, SEX, GENETIC_SEX, ETHNICITY, HIV_POSDATE, IVD, RISK, CV_SMOKED)
+stopifnot(!anyDuplicated(pat$ID))
+
+seq_samples <- samples_all %>%
+  filter(longitudinal, sequenced, !excluded_id, !mixed) %>%
+  select(ID, Sample, LABDATE) %>%
+  left_join(pat %>% select(ID, BORN), by = "ID") %>%
+  mutate(LABYEAR = year(LABDATE), Age = LABYEAR - BORN)
+stopifnot(!anyNA(seq_samples$Age))
+
+c(samples = nrow(seq_samples), individuals = n_distinct(seq_samples$ID))
+```
+
+
+## 1.2 Mutect2 CHIP calls
+
+`resources/chip_calls.csv` (written by `scripts/merge_mutect2_output.R`) has the Mutect2 records at CHIP
+positions, in VCF coordinates. The transcript of interest (`Variant`) is the entry of `AAChange.refGene`
+(`GeneDetail.refGene` for splicing variants) on the accession listed in `CHIP_candidate_variants.csv`.
+`add_variant()` is used for the calls of both assays.
+
+```{r annotation-helpers}
+chip_crit <- read.csv("resources/CHIP_screening/CHIP_candidate_variants.csv", fileEncoding = "UTF-8-BOM")
+accession_pattern <- paste(chip_crit$Accession, collapse = "|")
+
+# the one entry of a "sep"-separated annotation on an accession of interest
+pick_transcript <- function(x, sep) {
+  hits <- grep(accession_pattern, strsplit(x, sep, fixed = TRUE)[[1]], value = TRUE)
+  stopifnot(length(hits) == 1)
+  hits
+}
+
+# transcript of interest from AAChange.refGene, or GeneDetail.refGene for splicing variants (NA stays NA)
+transcript_of <- function(aachange, genedetail) {
+  x <- ifelse(aachange == ".", genedetail, aachange)
+  map_chr(x, function(a) if (is.na(a)) NA_character_ else pick_transcript(pick_transcript(a, ","), ";"))
+}
+
+add_variant <- function(df) {
+  df %>%
+    mutate(Variant            = transcript_of(AAChange.refGene, GeneDetail.refGene),
+           ExonicFunc.refGene = ifelse(ExonicFunc.refGene == ".", Func.refGene, ExonicFunc.refGene),
+           AAChange.refGene   = ifelse(AAChange.refGene == ".", GeneDetail.refGene, AAChange.refGene),
+           traj_id            = paste(ID, Variant, sep = ":"))
+}
+```
+
+`get_variant_locus()` (from `01_per_sample_LoD_and_QC.Rmd`) converts the VCF position and alleles to the
+ANNOVAR convention and to the allele string of the bam-readcount pileup (`A`, `+A`, `-A`). `rc_pos` is both the
+ANNOVAR `Start` and the position of the variant in the pileup.
+
+```{r variant-locus}
+# VCF (POS, REF, ALT) -> locus and alleles as used by ANNOVAR and bam-readcount.
+#   rc_pos                   : ANNOVAR Start, position of the variant in the bam-readcount output
+#   annovar_ref, annovar_alt : alleles in ANNOVAR coordinates ("-" for the missing allele of an indel)
+#   rc_allele                : allele string in the bam-readcount output ("A", "+A", "-A")
+get_variant_locus <- function(pos, ref, alt) {
+  ref <- toupper(ref)
+  alt <- toupper(alt)
+
+  if (nchar(ref) == nchar(alt)) {
+    return(tibble(var_type = ifelse(nchar(ref) == 1, "SNV", "MNV"), rc_pos = pos,
+                  annovar_ref = ref, annovar_alt = alt, rc_allele = alt))
+  }
+
+  # strip shared leading bases beyond the single VCF anchor base
+  while (nchar(ref) > 1 && nchar(alt) > 1 && substr(ref, 1, 1) == substr(alt, 1, 1)) {
+    ref <- substr(ref, 2, nchar(ref))
+    alt <- substr(alt, 2, nchar(alt))
+    pos <- pos + 1
+  }
+
+  if (nchar(alt) > nchar(ref)) {
+    # insertion: stays at the anchor position
+    inserted <- substr(alt, 2, nchar(alt))
+    tibble(var_type = "insertion", rc_pos = pos, annovar_ref = "-", annovar_alt = inserted,
+           rc_allele = paste0("+", inserted))
+  } else {
+    # deletion: starts one base after the anchor
+    deleted <- substr(ref, 2, nchar(ref))
+    tibble(var_type = "deletion", rc_pos = pos + 1, annovar_ref = deleted, annovar_alt = "-",
+           rc_allele = paste0("-", deleted))
+  }
+}
+```
+
+**Annotation of the called allele.** `merge_mutect2_output.R` gives each Mutect2 record the annotation of a CHIP
+variant of the Vanderbilt list found at the same position (+/- 1 bp), without comparing the alleles. A record
+next to a listed variant can therefore carry the annotation of another variant, and a record with two listed
+variants within 1 bp is written twice, once with each annotation. Here each record keeps one row with the
+annotation of its own allele, looked up by position and alleles (ANNOVAR coordinates) in the two lists of
+annotated CHIP variants: the Vanderbilt list (used only for its annotation, not as calls) and the cross-sectional
+screening. A record whose allele is in neither list is removed: it is not a known CHIP variant.
+
+```{r annotation-check}
+dict_cols <- c("Gene.refGene", "End", "Func.refGene", "GeneDetail.refGene", "ExonicFunc.refGene",
+               "AAChange.refGene", "cosmic70")
+
+cross_all <- read.table("resources/CHIP_screening/SHCS_Chip_all_vars.txt", sep = "\t", header = TRUE)
+
+annot_dict <- bind_rows(
+  read.csv("resources/CHIP_calls_longitudinal/CHIP_calls_all_long.csv", fileEncoding = "UTF-8-BOM") %>%
+    select(Chr, Start, Ref, Alt, all_of(dict_cols)),
+  cross_all %>% select(Chr, Start, Ref, Alt, all_of(dict_cols))) %>%
+  distinct()
+# one annotation per variant: the two lists agree wherever both list a variant
+stopifnot(!anyDuplicated(annot_dict[c("Chr", "Start", "Ref", "Alt")]))
+
+chip_calls_file <- read.csv("resources/chip_calls.csv")
+
+# no multiallelic records in this file
+stopifnot(!any(grepl(",", chip_calls_file$V5)))
+
+annot_check <- chip_calls_file %>%
+  rename(Chr = V1, Start = V2, Ref = V4, Alt = V5, FILTER = V7) %>%
+  mutate(locus = pmap(list(Start, Ref, Alt), get_variant_locus)) %>%
+  unnest(locus) %>%
+  left_join(annot_dict %>% rename_with(~ paste0(.x, "_allele"), all_of(dict_cols)),
+            by = c("Chr", "rc_pos" = "Start", "annovar_ref" = "Ref", "annovar_alt" = "Alt")) %>%
+  group_by(Sample, Chr, Start, Ref, Alt) %>%
+  mutate(own = !is.na(AAChange.refGene_allele) & AAChange.refGene == AAChange.refGene_allele &
+               GeneDetail.refGene == GeneDetail.refGene_allele,
+         row = case_when(is.na(AAChange.refGene_allele) ~ "allele in neither list: removed",
+                         own                            ~ "annotation of the called allele",
+                         any(own)                       ~ "second row of the record, annotation of a neighbouring variant: removed",
+                         TRUE                           ~ "annotation of a neighbouring variant: replaced")) %>%
+  ungroup()
+
+annot_check %>%
+  group_by(row) %>%
+  summarise(rows = n(), records = nrow(distinct(pick(Sample, Chr, Start, Ref, Alt))),
+            variants = nrow(distinct(pick(Chr, Start, Ref, Alt)))) %>%
+  knitr::kable(caption = "Rows of chip_calls.csv")
+
+annot_check %>%
+  filter(row != "annotation of the called allele") %>%
+  arrange(row, Chr, Start, Sample) %>%
+  transmute(Sample, Chr, Start, Ref, Alt, AF, row,
+            `annotation in chip_calls.csv` = transcript_of(AAChange.refGene, GeneDetail.refGene),
+            `annotation of the called allele` = transcript_of(AAChange.refGene_allele, GeneDetail.refGene_allele)) %>%
+  knitr::kable()
+```
+
+```{r calls}
+calls_raw <- annot_check %>%
+  filter(row %in% c("annotation of the called allele", "annotation of a neighbouring variant: replaced")) %>%
+  distinct(Sample, Chr, Start, Ref, Alt, .keep_all = TRUE) %>%
+  select(-all_of(dict_cols), -own, -row, -Accession, -transcriptOI, -NonsynOI) %>%
+  rename_with(~ sub("_allele$", "", .x), all_of(paste0(dict_cols, "_allele"))) %>%
+  inner_join(samples_all %>% select(Sample, ID, LABDATE, longitudinal, excluded_id, mixed), by = "Sample") %>%
+  add_variant() %>%
+  separate(AD, into = c("ref_reads", "alt_reads"), sep = ",", convert = TRUE, remove = FALSE)
+stopifnot(nrow(calls_raw) == sum(annot_check$row %in% c("annotation of the called allele",
+                                                         "annotation of a neighbouring variant: replaced")),
+          all(calls_raw$ref_reads + calls_raw$alt_reads == calls_raw$DP),
+          # one genomic variant per trajectory, at most one call per trajectory and sample
+          !anyDuplicated(distinct(calls_raw, traj_id, Chr, Start, Ref, Alt)$traj_id),
+          !anyDuplicated(calls_raw[c("traj_id", "Sample")]))
+
+calls_raw %>%
+  mutate(group = case_when(!longitudinal ~ "removed: individual with a single sample",
+                           excluded_id   ~ "removed: individual without a CHIP call",
+                           mixed         ~ "removed: sample with DNA from another person",
+                           TRUE          ~ "kept")) %>%
+  group_by(group) %>%
+  summarise(calls = n(), samples = n_distinct(Sample), individuals = n_distinct(ID),
+            trajectories = n_distinct(traj_id)) %>%
+  knitr::kable(caption = "Mutect2 CHIP calls")
+```
+
+Counts before the removal (all sequenced samples):
+
+```{r counts-raw}
+obs_raw <- calls_raw %>%
+  distinct(ID, traj_id) %>%
+  inner_join(samples_all %>% filter(sequenced) %>% select(ID, Sample), by = "ID", relationship = "many-to-many") %>%
+  left_join(calls_raw %>% distinct(traj_id, Sample) %>% mutate(detected = TRUE), by = c("traj_id", "Sample")) %>%
+  mutate(detected = replace_na(detected, FALSE))
+
+record_step("0. Mutect2 CHIP calls, all sequenced samples", obs_raw)
+```
+
+The calls kept, with the age at the timepoint. Mutect2 filter flags are not used:
+
+```{r calls-kept}
+calls <- calls_raw %>%
+  filter(longitudinal, !excluded_id, !mixed) %>%
+  select(-longitudinal, -excluded_id, -mixed, -LABDATE) %>%
+  inner_join(seq_samples, by = c("ID", "Sample"))
+stopifnot(nrow(calls) == sum(calls_raw$longitudinal & !calls_raw$excluded_id & !calls_raw$mixed))
+
+table(FILTER = calls$FILTER)
+```
+
+One annotation per trajectory, with the locus and allele of the pileup:
+
+```{r traj-annot}
+annot_cols <- c("Gene.refGene", "Chr", "Start", "End", "Ref", "Alt", "Func.refGene", "GeneDetail.refGene",
+                "ExonicFunc.refGene", "AAChange.refGene", "cosmic70", "Variant")
+
+traj_annot_long <- calls %>%
+  arrange(traj_id, LABDATE) %>%
+  group_by(traj_id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(ID, traj_id, all_of(annot_cols), var_type, rc_pos, rc_allele)
+
+table(variant_type = traj_annot_long$var_type)
+```
+
+
+## 1.3 bam-readcount pileup
+
+`resources/All.chip.bam_readcount.txt` has the read counts of every base at the CHIP positions in every
+longitudinal sample, with the alleles packed into `var1..varN` as `allele:count:avg_mapq:avg_baseq`. Overlapping
+regions list some positions twice; these rows are exact duplicates and are removed.
+
+```{r pileup}
+pileup <- read.table("resources/All.chip.bam_readcount.txt", sep = "\t", header = TRUE,
+                     stringsAsFactors = FALSE, colClasses = c(ref = "character")) %>%
+  distinct() %>%
+  filter(S_ID != pileup_sample_drop) %>%
+  mutate(S_ID = coalesce(unname(pileup_sample_alias[S_ID]), S_ID))
+stopifnot(!anyDuplicated(pileup[c("S_ID", "chr", "pos")]),
+          all(seq_samples$Sample %in% pileup$S_ID))
+
+pileup_sites <- pileup %>% select(S_ID, chr, pos, pileup_depth = depth)
+
+# one row per allele seen at each sample and position
+pileup_alleles <- pileup %>%
+  select(S_ID, chr, pos, starts_with("var")) %>%
+  pivot_longer(starts_with("var"), names_to = NULL, values_to = "allele_str", values_drop_na = TRUE) %>%
+  filter(allele_str != "") %>%
+  separate(allele_str, into = c("allele", "pileup_alt"), sep = ":", extra = "drop") %>%
+  mutate(pileup_alt = as.integer(pileup_alt))
+stopifnot(!anyDuplicated(pileup_alleles[c("S_ID", "chr", "pos", "allele")]))
+```
+
+The pileup counts are not filtered on base quality, Mutect2's are. Check of the locus mapping on the Mutect2
+calls: the pileup should see the called allele with about as many reads as Mutect2.
+
+```{r pileup-check}
+calls %>%
+  left_join(pileup_sites, by = c("Sample" = "S_ID", "Chr" = "chr", "rc_pos" = "pos")) %>%
+  left_join(pileup_alleles, by = c("Sample" = "S_ID", "Chr" = "chr", "rc_pos" = "pos", "rc_allele" = "allele")) %>%
+  group_by(var_type) %>%
+  summarise(calls = n(),
+            `with pileup depth` = sum(!is.na(pileup_depth)),
+            `allele seen in the pileup` = sum(!is.na(pileup_alt)),
+            `pileup / Mutect2 alt reads, median` = round(median(pileup_alt / alt_reads, na.rm = TRUE), 2),
+            `pileup depth / Mutect2 DP, median` = round(median(pileup_depth / DP, na.rm = TRUE), 2)) %>%
+  knitr::kable()
+```
+
+
+# 2. LoD of the Mutect2 CHIP calls
+
+For a site with depth `n` and `k` reads of the variant allele, `lod_frequentist()` of
+[`chip_lod`](https://github.com/adriaan-vd-graaf/chip_lod) (in `external/chip_lod`) returns:
+
+| column | meaning |
+|---|---|
+| `k_star` | smallest read count with P(K >= k) <= `alpha` under sequencing error alone (Poisson, `n * e / 3`) |
+| `called` | `k >= k_star` |
+| `lod_vaf` | smallest true VAF that reaches `k_star` reads with probability >= `power_target` at this depth |
+
+`k_star` and `lod_vaf` depend only on depth. As in `01_per_sample_LoD_and_QC.Rmd`, only `model.R` and `lod.R` are sourced,
+into their own environment. `add_lod()` runs the package on the (`n`, `k`) pairs not seen before and keeps the
+results in `lod_tab`, so each pair is calculated once.
+
+```{r chip-lod}
+chip_lod <- new.env()
+for (f in c("model.R", "lod.R")) {
+  sys.source(file.path("external/chip_lod", "r", "R", f), envir = chip_lod)
+}
+lod_frequentist <- chip_lod$lod_frequentist
+
+lod_tab <- NULL
+
+# df with read counts n (depth) and k (variant reads), NA where there is no depth
+add_lod <- function(df) {
+  new_pairs <- df %>%
+    filter(!is.na(n), n > 0) %>%
+    distinct(n, k) %>%
+    mutate(n = as.integer(n), k = as.integer(k))
+  if (!is.null(lod_tab)) new_pairs <- anti_join(new_pairs, lod_tab, by = c("n", "k"))
+  if (nrow(new_pairs) > 0) {
+    lod_tab <<- bind_rows(lod_tab,
+                          lod_frequentist(n = new_pairs$n, k = new_pairs$k,
+                                          e = err_rate, alpha = alpha, power_target = power_tgt) %>%
+                            select(n, k, k_star, called, lod_vaf))
+  }
+  df %>%
+    left_join(lod_tab, by = c("n", "k")) %>%
+    mutate(vaf_reads  = k / n,
+           lod_status = case_when(is.na(lod_vaf)        ~ NA_character_,
+                                  !called               ~ "not called (k < k*)",
+                                  vaf_reads < lod_vaf   ~ "called, VAF < LoD",
+                                  TRUE                  ~ "VAF >= LoD"),
+           lod_status = factor(lod_status, levels = status_levels))
+}
+```
+
+LoD of every Mutect2 call kept in section 1, from Mutect2's own read counts (`n = DP`, `k` = alternate reads of
+`AD`). The LoD is compared with the read fraction `k / n`, which is on the scale of `lod_vaf`; the CHIP threshold
+of 2% is applied to Mutect2's `AF`, the VAF of the final table. The two differ a little:
+
+```{r calls-lod}
+calls <- calls %>%
+  mutate(n = DP, k = alt_reads) %>%
+  add_lod()
+stopifnot(!anyNA(calls$lod_vaf))
+
+table(`Mutect2 AF >= 2%` = calls$AF >= chip_vaf, `k / n >= 2%` = calls$vaf_reads >= chip_vaf)
+```
+
+**Summary of all Mutect2 CHIP calls** (after the removal of section 1):
+
+```{r calls-lod-summary}
+calls %>%
+  summarise(calls = n(), samples = n_distinct(Sample), individuals = n_distinct(ID),
+            `variants x individuals` = n_distinct(traj_id),
+            `calls with VAF >= LoD` = n_pct(lod_status == "VAF >= LoD"),
+            `calls with VAF >= 2%` = n_pct(AF >= chip_vaf),
+            `calls with VAF >= LoD and >= 2%` = n_pct(lod_status == "VAF >= LoD" & AF >= chip_vaf)) %>%
+  knitr::kable()
+
+calls %>%
+  summarise(`depth (DP), median (IQR)` = med_iqr(n),
+            `depth, range` = paste(range(n), collapse = "-"),
+            `k*, range` = paste(range(k_star), collapse = "-"),
+            `LoD VAF %, median (IQR)` = med_iqr(lod_vaf, 2, 100),
+            `LoD VAF %, range` = paste(round(100 * range(lod_vaf), 2), collapse = "-"),
+            `VAF % (AF), median (IQR)` = med_iqr(AF, 2, 100)) %>%
+  knitr::kable()
+
+calls %>%
+  count(lod_status, `VAF >= 2%` = ifelse(AF >= chip_vaf, "VAF >= 2%", "VAF < 2%")) %>%
+  pivot_wider(names_from = `VAF >= 2%`, values_from = n, values_fill = 0) %>%
+  mutate(total = rowSums(across(where(is.numeric)))) %>%
+  knitr::kable(caption = "Calls by LoD status and VAF")
+```
+
+By gene:
+
+```{r calls-lod-gene}
+calls %>%
+  group_by(Gene.refGene) %>%
+  summarise(calls = n(), trajectories = n_distinct(traj_id),
+            `VAF >= LoD` = n_pct(lod_status == "VAF >= LoD"),
+            `VAF >= 2%` = n_pct(AF >= chip_vaf),
+            `LoD VAF %, median` = round(100 * median(lod_vaf), 2)) %>%
+  arrange(-calls) %>%
+  knitr::kable()
+```
+
+Each point is one call; line: LoD at each depth, dashed line: 2%.
+
+```{r calls-lod-plot, fig.height=4.5}
+ggplot(calls, aes(x = n, y = vaf_reads)) +
+  geom_line(data = calls %>% distinct(n, lod_vaf), aes(y = lod_vaf), linewidth = 0.4) +
+  geom_point(aes(colour = lod_status), size = 1.3, alpha = 0.8) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+  scale_y_log10(labels = percent) +
+  scale_colour_manual(values = status_colors, drop = FALSE) +
+  labs(x = "Depth (Mutect2 DP)", y = "VAF (k / n)", colour = NULL) +
+  theme_classic()
+```
+
+`r sum(calls$lod_status != "VAF >= LoD")` of the `r nrow(calls)` calls are below the LoD (listed if any):
+
+```{r calls-below-lod}
+if (any(calls$lod_status != "VAF >= LoD")) calls %>%
+  filter(lod_status != "VAF >= LoD") %>%
+  arrange(ID, Variant, LABDATE) %>%
+  transmute(ID, Sample, Gene.refGene, Variant, FILTER, n, k, k_star, `VAF % (k/n)` = round(100 * vaf_reads, 3),
+            `LoD VAF %` = round(100 * lod_vaf, 3), lod_status) %>%
+  knitr::kable()
+```
+
+
+# 3. Unfiltered trajectories
+
+Every trajectory is crossed with all longitudinal samples of its individual. At a timepoint with a Mutect2 call
+the read counts are Mutect2's; at the other timepoints they are the pileup counts at the variant (`k = 0` where
+the allele was not seen), which give the LoD of the timepoint and are used in sections 6 and 8.
+
+```{r grid}
+call_cols <- c("traj_id", "Sample", "AF", "DP", "GT", "AD", "F1R2", "F2R1", "FILTER", "alt_reads")
+
+# every trajectory x every longitudinal sample of its individual
+build_grid <- function(traj) {
+  traj %>%
+    inner_join(seq_samples, by = "ID", relationship = "many-to-many") %>%
+    left_join(calls %>% select(all_of(call_cols)) %>% mutate(mutect = TRUE), by = c("traj_id", "Sample")) %>%
+    left_join(pileup_sites, by = c("Sample" = "S_ID", "Chr" = "chr", "rc_pos" = "pos")) %>%
+    left_join(pileup_alleles, by = c("Sample" = "S_ID", "Chr" = "chr", "rc_pos" = "pos", "rc_allele" = "allele")) %>%
+    mutate(mutect     = replace_na(mutect, FALSE),
+           pileup_alt = ifelse(is.na(pileup_depth), NA, replace_na(pileup_alt, 0L)),
+           # read counts for the LoD: Mutect2's at a call, the pileup's at the other timepoints
+           n = ifelse(mutect, DP, pileup_depth),
+           k = ifelse(mutect, alt_reads, pileup_alt),
+           type     = "long",
+           source   = ifelse(mutect, "Mutect2", "not detected"),
+           detected = mutect) %>%
+    add_lod()
+}
+
+grid_long <- build_grid(traj_annot_long) %>%
+  arrange(ID, traj_id, LABDATE)
+stopifnot(sum(grid_long$mutect) == nrow(calls), !anyDuplicated(grid_long[c("traj_id", "Sample")]))
+
+grid_long %>%
+  group_by(`Mutect2 call` = mutect) %>%
+  summarise(timepoints = n(), `with depth` = sum(!is.na(n)), `LoD available` = sum(!is.na(lod_vaf))) %>%
+  knitr::kable()
+
+record_step("1-3. Mutect2 CHIP calls after removal of 2 individuals and mixed samples", grid_long)
+```
+
+All trajectories, one panel per individual. Filled circle: Mutect2 call with VAF >= LoD; triangle: Mutect2 call
+below the LoD; cross: sequenced sample without a call of this variant (drawn at 0). Dashed line: 2%.
+
+```{r plot-unfiltered, fig.width=14, fig.height=11}
+grid_long %>%
+  mutate(point   = case_when(mutect & lod_status == "VAF >= LoD" ~ "Mutect2, VAF >= LoD",
+                             mutect                              ~ "Mutect2, VAF < LoD",
+                             TRUE                                ~ "not detected"),
+         AF_plot = ifelse(mutect, AF, 0)) %>%
+  plot_traj("point", shape_status, "Mutect2 CHIP calls, unfiltered")
+```
+
+
+# 4. Cross-sectional CHIP screening
+
+The calls of the cross-sectional CHIP screening (`SHCS_Chip_all_vars.txt`, one sample per individual, date in
+`SHCS_Chip_per_person.txt`) are read for the individuals of section 1. They are added to the trajectories only if
+`use_cross` is `TRUE` (now `r use_cross`); otherwise they are only summarised here, and the rest of the notebook
+uses the longitudinal sequencing alone. The screening used another DNA sample, so the removal of samples with DNA
+from another person does not apply to it. Its coordinates are ANNOVAR's, which already give the locus and allele
+of the pileup (`-` marks the missing allele of an indel).
+
+```{r cross}
+# cross_all: all calls of the screening, read in section 1.2
+cross_per_person <- read.table("resources/CHIP_screening/SHCS_Chip_per_person.txt", sep = " ", header = TRUE)
+stopifnot(!anyDuplicated(cross_per_person$ID))
+
+cross_calls <- cross_all %>%
+  filter(ID %in% seq_samples$ID) %>%
+  select(ID, all_of(setdiff(annot_cols, "Variant")), GT, AD, AF, DP, F1R2, F2R1) %>%
+  inner_join(cross_per_person %>% transmute(ID, Sample, LABDATE = as.Date(LABDATE)), by = "ID") %>%
+  left_join(pat %>% select(ID, BORN), by = "ID") %>%
+  mutate(LABYEAR = year(LABDATE), Age = LABYEAR - BORN) %>%
+  add_variant() %>%
+  separate(AD, into = c("ref_reads", "alt_reads"), sep = ",", convert = TRUE, remove = FALSE) %>%
+  # ANNOVAR (Start, Ref, Alt) -> locus and allele of the pileup
+  mutate(var_type  = case_when(Ref == "-"                        ~ "insertion",
+                               Alt == "-"                        ~ "deletion",
+                               nchar(Ref) == 1 & nchar(Alt) == 1 ~ "SNV",
+                               TRUE                              ~ "MNV"),
+         rc_pos    = Start,
+         rc_allele = case_when(Ref == "-" ~ paste0("+", Alt),
+                               Alt == "-" ~ paste0("-", Ref),
+                               TRUE       ~ Alt),
+         n = DP, k = alt_reads) %>%
+  add_lod()
+stopifnot(!anyDuplicated(cross_calls$traj_id), !anyNA(cross_calls$Age), all(cross_calls$k <= cross_calls$n),
+          !any(cross_calls$Sample %in% seq_samples$Sample))
+
+# a variant called in both assays has the same traj_id and the same pileup locus, and no cross-sectional call
+# sits at the locus of a Mutect2 trajectory under another traj_id
+in_both <- cross_calls %>%
+  select(traj_id, rc_pos, rc_allele) %>%
+  inner_join(traj_annot_long %>% select(traj_id, rc_pos_long = rc_pos, rc_allele_long = rc_allele), by = "traj_id")
+stopifnot(all(in_both$rc_pos == in_both$rc_pos_long & in_both$rc_allele == in_both$rc_allele_long),
+          nrow(cross_calls %>%
+                 anti_join(traj_annot_long, by = "traj_id") %>%
+                 semi_join(traj_annot_long, by = c("ID", "Chr", "rc_pos", "rc_allele"))) == 0)
+
+cross_calls %>%
+  summarise(calls = n(), individuals = n_distinct(ID),
+            `variant also called by Mutect2` = sum(traj_id %in% traj_annot_long$traj_id),
+            `variant only in the screening` = sum(!traj_id %in% traj_annot_long$traj_id),
+            `sample date = a longitudinal sample date` = sum(paste(ID, LABDATE) %in% paste(seq_samples$ID, seq_samples$LABDATE)),
+            `depth, median (IQR)` = med_iqr(n),
+            `VAF %, median (IQR)` = med_iqr(AF, 2, 100),
+            `LoD VAF %, median (IQR)` = med_iqr(lod_vaf, 2, 100),
+            `VAF >= LoD` = n_pct(lod_status == "VAF >= LoD")) %>%
+  knitr::kable(caption = "Cross-sectional calls")
+```
+
+The screening reports calls with VAF >= 2% only (the smallest VAF of all its calls is
+`r percent(min(cross_all$AF), 0.1)`), and its reads are not available here. When used, a cross-sectional call is
+therefore a detected timepoint, but a variant without a cross-sectional call gets no "not detected" timepoint (and
+no imputed value) at this sample.
+
+When used, variants called only in the screening become new trajectories: their longitudinal samples are added as
+above (not detected, with pileup counts). Their annotation is the ANNOVAR one of the screening; the other
+trajectories keep the one of their Mutect2 calls.
+
+```{r cross-grid}
+if (use_cross) {
+  traj_annot <- bind_rows(
+    traj_annot_long,
+    cross_calls %>%
+      filter(!traj_id %in% traj_annot_long$traj_id) %>%
+      select(ID, traj_id, all_of(annot_cols), var_type, rc_pos, rc_allele))
+
+  cross_cols <- c("traj_id", "Sample", "LABDATE", "BORN", "LABYEAR", "Age", "AF", "DP", "GT", "AD", "F1R2", "F2R1",
+                  "alt_reads", "n", "k", "k_star", "called", "lod_vaf", "vaf_reads", "lod_status")
+
+  grid_all <- bind_rows(
+    build_grid(traj_annot),
+    cross_calls %>%
+      select(all_of(cross_cols)) %>%
+      left_join(traj_annot, by = "traj_id") %>%
+      mutate(mutect = FALSE, type = "cross", source = "cross-sectional", detected = TRUE)) %>%
+    arrange(ID, traj_id, LABDATE)
+} else {
+  traj_annot <- traj_annot_long
+  grid_all   <- grid_long
+}
+stopifnot(!anyDuplicated(grid_all[c("traj_id", "Sample")]))
+
+record_step(if (use_cross) "4. + cross-sectional calls" else "4. cross-sectional calls not used", grid_all)
+```
+
+`r if (use_cross) "Circle: Mutect2 call; square: cross-sectional call; cross: not detected (drawn at 0)." else "No plot: without the cross-sectional calls the trajectories are those of section 3."`
+
+```{r plot-cross, eval = use_cross, fig.width=14, fig.height=11}
+grid_all %>%
+  mutate(AF_plot = ifelse(detected, AF, 0)) %>%
+  plot_traj("source", shape_cross, "Mutect2 and cross-sectional calls, unfiltered")
+```
+
+
+# 5. Filter: VAF >= 2% and LoD
+
+A trajectory is kept if at least one call (Mutect2 or cross-sectional) has a VAF >= 2% and at least
+`min_tp_above_lod` = `r min_tp_above_lod` calls have a VAF >= LoD.
+
+```{r filter-s5}
+traj_s5_summary <- grid_all %>%
+  filter(detected) %>%
+  group_by(ID, traj_id, Gene.refGene) %>%
+  summarise(calls = n(), mutect_calls = sum(source == "Mutect2"), cross_calls = sum(source == "cross-sectional"),
+            max_AF = max(AF), max_AF_mutect = suppressWarnings(max(AF[source == "Mutect2"])),
+            calls_above_lod = sum(lod_status == "VAF >= LoD"), .groups = "drop")
+
+# effect of the LoD requirement
+map_dfr(1:2, function(m) {
+  traj_s5_summary %>%
+    summarise(`calls >= LoD required` = m,
+              `max VAF >= 2%` = sum(max_AF >= chip_vaf),
+              `max VAF >= 2% and enough calls >= LoD` = sum(max_AF >= chip_vaf & calls_above_lod >= m),
+              individuals = n_distinct(ID[max_AF >= chip_vaf & calls_above_lod >= m]))
+}) %>%
+  knitr::kable(caption = "Trajectories kept (of all trajectories)")
+
+traj_s5_summary <- traj_s5_summary %>%
+  mutate(reason = case_when(max_AF < chip_vaf                    ~ "removed: max VAF < 2%",
+                            calls_above_lod < min_tp_above_lod   ~ "removed: too few calls >= LoD",
+                            TRUE                                 ~ "kept"))
+
+traj_s5_summary %>%
+  group_by(reason) %>%
+  summarise(trajectories = n(), individuals = n_distinct(ID), `calls, median` = median(calls),
+            `max VAF %, median` = round(100 * median(max_AF), 2)) %>%
+  knitr::kable()
+
+traj_s5 <- traj_s5_summary$traj_id[traj_s5_summary$reason == "kept"]
+grid_s5 <- grid_all %>% filter(traj_id %in% traj_s5)
+
+record_step("5. >= 1 call with VAF >= 2% and >= min_tp_above_lod calls >= LoD", grid_s5)
+```
+
+Of the `r sum(grid_all$detected)` calls of either assay, `r sum(grid_all$detected & grid_all$lod_status != "VAF >= LoD")`
+are below the LoD. Requiring two calls >= LoD (`min_tp_above_lod = 2`) removes the
+`r sum(traj_s5_summary$max_AF >= chip_vaf & traj_s5_summary$calls_above_lod < 2)` trajectories with a single
+call, before section 6 can add timepoints to them.
+
+Trajectories whose only call >= 2% is the cross-sectional one (no Mutect2 call >= 2%). They pass this filter only
+with `use_cross = TRUE`; `in the set` says whether they are kept here.
+
+```{r filter-s5-cross}
+calls %>%
+  group_by(traj_id) %>%
+  summarise(mutect_calls = n(), max_AF_mutect = max(AF), .groups = "drop") %>%
+  right_join(cross_calls %>% select(ID, traj_id, Gene.refGene, AF_cross = AF), by = "traj_id") %>%
+  filter(AF_cross >= chip_vaf, is.na(max_AF_mutect) | max_AF_mutect < chip_vaf) %>%
+  arrange(ID) %>%
+  transmute(ID, traj_id, Gene.refGene, mutect_calls = replace_na(mutect_calls, 0L),
+            `max Mutect2 VAF %` = round(100 * max_AF_mutect, 2), `cross-sectional VAF %` = round(100 * AF_cross, 2),
+            `in the set` = traj_id %in% traj_s5) %>%
+  knitr::kable()
+```
+
+```{r plot-s5, fig.width=14, fig.height=11}
+grid_s5 %>%
+  mutate(AF_plot = ifelse(detected, AF, 0)) %>%
+  plot_traj("source", shape_cross, "After section 5")
+```
+
+
+# 6. Timepoints added from bam-readcount
+
+For the trajectories of section 5, the same variant (position and allele) is looked up in the pileup at the
+longitudinal timepoints without a Mutect2 call. A timepoint is added when the pileup has at least
+`min_alt_reads` = `r min_alt_reads` read of the variant allele: at the position of a clone the individual is known
+to carry, any read of the allele is taken as the clone. Its VAF is the pileup read fraction. Calls are never
+replaced.
+
+At a depth of 2000, sequencing error alone gives on average `r round(2000 * err_rate / 3, 2)` reads of a given
+base, so part of the timepoints with one or two reads can be error. The table shows where the added timepoints
+stand against the LoD of their depth.
+
+```{r bam-timepoints}
+bam_obs <- grid_s5 %>%
+  filter(source == "not detected") %>%
+  mutate(pileup = case_when(is.na(n)                          ~ "no depth",
+                            k == 0                            ~ "0 reads",
+                            !called                           ~ "1 read to k* - 1 (not called)",
+                            lod_status == "called, VAF < LoD" ~ ">= k*, VAF < LoD",
+                            TRUE                              ~ "VAF >= LoD"),
+         pileup = factor(pileup, levels = c("no depth", "0 reads", "1 read to k* - 1 (not called)",
+                                            ">= k*, VAF < LoD", "VAF >= LoD")))
+
+bam_obs %>%
+  count(var_type, pileup) %>%
+  pivot_wider(names_from = pileup, values_from = n, values_fill = 0) %>%
+  knitr::kable(caption = "Longitudinal timepoints without a Mutect2 call, by reads of the variant allele in the pileup")
+```
+
+```{r bam-add}
+grid_s6 <- grid_s5 %>%
+  mutate(bam      = source == "not detected" & !is.na(k) & k >= min_alt_reads,
+         source   = ifelse(bam, "bam-readcount", source),
+         detected = source != "not detected",
+         AF       = ifelse(bam, vaf_reads, AF)) %>%
+  select(-bam)
+
+grid_s6 %>%
+  filter(source == "bam-readcount") %>%
+  summarise(`timepoints added` = n(), trajectories = n_distinct(traj_id), individuals = n_distinct(ID),
+            `reads, median (range)` = sprintf("%d (%d-%d)", as.integer(median(k)), min(k), max(k)),
+            `VAF %, median (IQR)` = med_iqr(vaf_reads, 3, 100),
+            `not called (k < k*)` = n_pct(lod_status == "not called (k < k*)"),
+            `VAF >= LoD` = n_pct(lod_status == "VAF >= LoD")) %>%
+  knitr::kable()
+
+record_step(paste0("6. + bam-readcount timepoints (>= ", min_alt_reads, " read)"), grid_s6)
+```
+
+Circle: Mutect2 call; square: cross-sectional call (with `use_cross`); triangle: timepoint added from bam-readcount; cross: not
+detected (drawn at 0).
+
+```{r plot-s6, fig.width=14, fig.height=11}
+grid_s6 %>%
+  mutate(AF_plot = ifelse(detected, AF, 0)) %>%
+  plot_traj("source", shape_source, "After section 6: calls and bam-readcount timepoints")
+```
+
+
+# 7. Filter: >= 2 detected timepoints
+
+A trajectory is kept if it has at least `min_timepoints` = `r min_timepoints` detected timepoints (Mutect2,
+cross-sectional or bam-readcount), at least one of them with VAF >= 2%. After section 5 every trajectory has a
+call >= 2%, so the filter removes the trajectories seen at a single timepoint.
+
+```{r filter-s7}
+traj_s7_summary <- grid_s6 %>%
+  group_by(ID, traj_id, Gene.refGene) %>%
+  summarise(detected_timepoints = sum(detected), calls = sum(source %in% c("Mutect2", "cross-sectional")),
+            max_AF = max(AF[detected]), no_pileup = sum(type == "long" & is.na(n)), .groups = "drop") %>%
+  mutate(kept = detected_timepoints >= min_timepoints & max_AF >= chip_vaf)
+
+traj_s7_summary %>%
+  count(kept, name = "trajectories") %>%
+  knitr::kable()
+
+if (any(!traj_s7_summary$kept)) traj_s7_summary %>%
+  filter(!kept) %>%
+  arrange(ID) %>%
+  transmute(ID, traj_id, Gene.refGene, detected_timepoints, calls, `max VAF %` = round(100 * max_AF, 2),
+            `longitudinal timepoints without pileup depth` = no_pileup) %>%
+  knitr::kable(caption = "Trajectories removed")
+
+traj_s7 <- traj_s7_summary$traj_id[traj_s7_summary$kept]
+grid_s7 <- grid_s6 %>% filter(traj_id %in% traj_s7)
+
+record_step("7. >= 2 detected timepoints, >= 1 with VAF >= 2%", grid_s7)
+```
+
+`r if (any(!traj_s7_summary$kept)) sprintf("%d of the %d removed trajectories have longitudinal timepoints without pileup depth: the pileup was not run at their position (a variant called only in the cross-sectional screening), so no timepoint could be added to them in section 6.", sum(!traj_s7_summary$kept & traj_s7_summary$no_pileup > 0), sum(!traj_s7_summary$kept)) else "No trajectory is removed."`
+
+
+# 8. LoD and not detected timepoints
+
+## 8.1 LoD at every timepoint
+
+Each timepoint of a trajectory has a LoD from its depth: the call's depth (`DP`) at a Mutect2 or cross-sectional
+call, the pileup depth at the variant otherwise. Mean and sd of the LoD over all timepoints of each trajectory
+(timepoints without depth are left out):
+
+```{r lod-traj}
+lod_traj <- grid_s7 %>%
+  group_by(ID, traj_id, Gene.refGene) %>%
+  summarise(timepoints = n(), `timepoints with LoD` = sum(!is.na(lod_vaf)),
+            lod_mean = mean(lod_vaf, na.rm = TRUE), lod_sd = sd(lod_vaf, na.rm = TRUE), .groups = "drop") %>%
+  mutate(lod_cv = lod_sd / lod_mean)
+stopifnot(all(lod_traj$`timepoints with LoD` >= 2))
+
+lod_traj %>%
+  summarise(trajectories = n(),
+            `mean LoD %, median (IQR)` = med_iqr(lod_mean, 3, 100),
+            `mean LoD %, range` = paste(round(100 * range(lod_mean), 3), collapse = "-"),
+            `sd of LoD %, median (IQR)` = med_iqr(lod_sd, 3, 100),
+            `sd of LoD %, max` = round(100 * max(lod_sd), 3),
+            `CV (sd / mean), median (IQR)` = med_iqr(lod_cv, 2)) %>%
+  knitr::kable(caption = "LoD per trajectory")
+```
+
+```{r lod-traj-plot, fig.width=12, fig.height=5}
+p_mean <- ggplot(lod_traj, aes(x = lod_mean)) +
+  geom_histogram(bins = 30, fill = "grey60", colour = "white") +
+  scale_x_continuous(labels = percent) +
+  labs(x = "Mean LoD of the trajectory (VAF)", y = "Trajectories") +
+  theme_classic()
+
+p_range <- lod_traj %>%
+  mutate(traj_id = fct_reorder(traj_id, lod_mean)) %>%
+  ggplot(aes(x = traj_id, y = lod_mean, ymin = lod_mean - lod_sd, ymax = lod_mean + lod_sd, colour = Gene.refGene)) +
+  geom_pointrange(size = 0.2) +
+  scale_y_continuous(labels = percent) +
+  scale_colour_manual(values = gene_colors) +
+  labs(x = "Trajectories (ordered by mean LoD)", y = "LoD, mean +/- sd", colour = "CHIP gene") +
+  theme_classic() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+ggarrange(p_mean, p_range, ncol = 2, widths = c(1, 1.6), labels = c("A", "B"))
+```
+
+LoD across all timepoints of these trajectories, by type of timepoint (the cross-sectional screening, when used,
+was sequenced less deeply and has a higher LoD):
+
+```{r lod-all-timepoints}
+lod_summary <- function(df) {
+  df %>%
+    summarise(timepoints = n(), `with LoD` = sum(!is.na(lod_vaf)),
+              `depth, median (IQR)` = med_iqr(n),
+              `LoD %, mean` = round(100 * mean(lod_vaf, na.rm = TRUE), 3),
+              `LoD %, sd` = round(100 * sd(lod_vaf, na.rm = TRUE), 3),
+              `LoD %, median (IQR)` = med_iqr(lod_vaf, 3, 100),
+              `LoD %, range` = paste(round(100 * range(lod_vaf, na.rm = TRUE), 3), collapse = "-"),
+              `LoD > 1%` = sum(lod_vaf > 0.01, na.rm = TRUE),
+              `LoD > 2%` = sum(lod_vaf > chip_vaf, na.rm = TRUE))
+}
+
+bind_rows(grid_s7 %>% group_by(timepoint = source) %>% lod_summary(),
+          grid_s7 %>% lod_summary() %>% mutate(timepoint = "all")) %>%
+  knitr::kable()
+```
+
+
+## 8.2 VAF of the not detected timepoints
+
+A not detected timepoint says that the clone was below what the assay could see in this sample: its VAF is
+somewhere between 0 and the LoD of the timepoint, which depends on the depth at the variant in this sample. It
+gets `impute_fraction` = `r impute_fraction` times this LoD, the middle of that interval and the usual
+substitution for values below a detection limit when the distribution is skewed towards 0 (Hornung & Reed, 1990),
+as clone sizes before detection are. A timepoint without depth would get the same fraction of the mean LoD of its
+trajectory.
+
+Runs of consecutive not detected timepoints are then shortened: before the first detected timepoint of a
+trajectory only the last not detected timepoint is kept, after the last detected timepoint only the first, i.e.
+the one closest to a detected timepoint. It dates the appearance (or disappearance) of the clone; the earlier
+(later) ones would add a flat stretch whose level is set by the depth, not by the clone. Not detected timepoints
+between two detected ones are all kept.
+
+```{r impute}
+grid_s8 <- grid_s7 %>%
+  left_join(lod_traj %>% select(traj_id, lod_mean, lod_sd), by = "traj_id") %>%
+  mutate(imputed = !detected,
+         AF      = ifelse(imputed, impute_fraction * coalesce(lod_vaf, lod_mean), AF),
+         source  = ifelse(imputed, "imputed", source)) %>%
+  arrange(traj_id, LABDATE, type) %>%
+  group_by(traj_id) %>%
+  mutate(position = case_when(detected                          ~ "detected",
+                              cumsum(detected) == 0             ~ "before the first detected timepoint",
+                              rev(cumsum(rev(detected))) == 0   ~ "after the last detected timepoint",
+                              TRUE                              ~ "between two detected timepoints"),
+         keep = detected | position == "between two detected timepoints" |
+                (position == "before the first detected timepoint" & lead(detected, default = FALSE)) |
+                (position == "after the last detected timepoint" & lag(detected, default = FALSE))) %>%
+  ungroup()
+
+c(`not detected timepoints without a LoD of their own` = sum(grid_s8$imputed & is.na(grid_s8$lod_vaf)))
+
+grid_s8 %>%
+  filter(imputed) %>%
+  group_by(position) %>%
+  summarise(`not detected timepoints` = n(), kept = sum(keep), removed = sum(!keep),
+            trajectories = n_distinct(traj_id), `imputed VAF %, median (range)` =
+              sprintf("%.3f (%.3f-%.3f)", 100 * median(AF), 100 * min(AF), 100 * max(AF))) %>%
+  knitr::kable()
+
+my_chip_calls_imputed <- grid_s8 %>%
+  filter(keep) %>%
+  select(-position, -keep)
+
+record_step("8. + not detected timepoints at LoD/2, runs shortened", my_chip_calls_imputed)
+```
+
+Bam-readcount timepoints with few reads can have a lower VAF than a not detected timepoint at the same depth:
+`r sum(grid_s8$source == "bam-readcount" & grid_s8$AF < impute_fraction * grid_s8$lod_vaf)` of the
+`r sum(grid_s8$source == "bam-readcount")` bam-readcount timepoints are below `impute_fraction` times the LoD of
+their timepoint.
+
+Final trajectories, log scale (on a linear scale the imputed values are indistinguishable from 0). Circle:
+Mutect2 call; square: cross-sectional call (with `use_cross`); triangle: bam-readcount; open circle: imputed.
+
+```{r plot-imputed, fig.width=14, fig.height=11}
+my_chip_calls_imputed %>%
+  mutate(AF_plot = AF) %>%
+  plot_traj("source", shape_imputed, "Final trajectories, not detected timepoints at LoD / 2", y_log = TRUE)
+```
+
+
+## 8.3 Trajectory-specific LoD
+
+One trajectory per panel (the trajectories of section 7). Black dotted line: LoD of each timepoint, from the depth
+at the variant in that sample (section 8.1). Circle: Mutect2 call; square: cross-sectional call (with `use_cross`); triangle:
+bam-readcount; open circle: imputed (half the LoD of the timepoint, the final trajectory of section 8.2); cross:
+not detected timepoint removed when the runs were shortened (drawn at 0). The coloured line joins the timepoints
+of the final trajectory. Dashed line: 2%. The y axis is pseudo-logarithmic, so that 0, the LoD and the CHIP
+threshold show on the same scale.
+
+```{r plot-traj-lod, fig.width=16, fig.height=22}
+vaf_trans  <- pseudo_log_trans(sigma = 2e-4, base = 10)
+vaf_breaks <- c(0, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3)
+shape_lod  <- c(shape_imputed, "not detected" = 4)
+
+# every timepoint of section 7; the ones removed in section 8.2 become crosses at 0
+lod_panels <- grid_s8 %>%
+  mutate(panel   = fct_reorder(paste(ID, Gene.refGene, sub(".*:", "", Variant)), ID),
+         point   = ifelse(keep, source, "not detected"),
+         AF_plot = ifelse(keep, AF, 0))
+
+p_traj_lod <- ggplot(lod_panels, aes(x = Age)) +
+  geom_line(aes(y = lod_vaf, linetype = "LoD of the timepoint"), colour = "black", linewidth = 0.5) +
+  geom_line(data = filter(lod_panels, keep), aes(y = AF_plot, colour = Gene.refGene), linewidth = 0.5) +
+  geom_point(aes(y = AF_plot, colour = Gene.refGene, shape = point), size = 1.6) +
+  geom_hline(yintercept = chip_vaf, linewidth = 0.4, linetype = "dashed") +
+  scale_y_continuous(trans = vaf_trans, breaks = vaf_breaks, labels = percent_format(accuracy = 0.1)) +
+  scale_colour_manual(values = gene_colors) +
+  scale_shape_manual(values = shape_lod, limits = names(shape_lod)) +
+  scale_linetype_manual(values = c("LoD of the timepoint" = "dotted")) +
+  facet_wrap(~panel, ncol = 8, scales = "free_x") +
+  labs(x = "Age", y = "VAF", colour = "CHIP gene", shape = NULL, linetype = NULL) +
+  theme_classic(base_size = 10) +
+  theme(strip.text = element_text(size = 7), legend.position = "bottom")
+
+p_traj_lod
+```
+
+
+## 8.4 Trajectory-specific LoD with the cross-sectional calls
+
+The plot of section 8.3, with the calls of the cross-sectional screening (section 4) added as squares and the LoD of
+the cross-sectional sample added to the black dotted line. The calls are only drawn here and are not part of the
+trajectories: the panels and the coloured line are those of section 8.3. With `use_cross = TRUE` the two plots are
+the same.
+
+```{r plot-traj-lod-cross, fig.width=16, fig.height=22}
+shape_lod_cross <- c("Mutect2" = 16, "cross-sectional" = 15, "bam-readcount" = 17, "imputed" = 1, "not detected" = 4)
+
+# cross-sectional calls of the trajectories of section 8.3 that are not already in its plot
+cross_points <- cross_calls %>%
+  anti_join(lod_panels, by = c("traj_id", "Sample")) %>%
+  select(traj_id, Age, AF_plot = AF, lod_vaf) %>%
+  inner_join(lod_panels %>% distinct(traj_id, panel, Gene.refGene), by = "traj_id") %>%
+  mutate(point = "cross-sectional")
+
+# the layers of section 8.3 on data with these timepoints added: the dotted line and the points use them, the
+# coloured line keeps its own data
+p_traj_lod %+%
+  bind_rows(lod_panels, cross_points) +
+  scale_shape_manual(values = shape_lod_cross, limits = names(shape_lod_cross))
+```
+
+The screening was sequenced less deeply, so the dotted line rises at the cross-sectional sample (median LoD
+`r percent(median(cross_calls$lod_vaf), 0.01)`). `r nrow(semi_join(cross_calls, lod_panels, by = "traj_id"))` of the
+`r nrow(cross_calls)` cross-sectional calls are in this plot. The others belong to trajectories without a panel:
+
+```{r cross-not-in-plot}
+cross_calls %>%
+  anti_join(lod_panels, by = "traj_id") %>%
+  arrange(ID) %>%
+  transmute(ID, traj_id, `Mutect2 calls` = map_int(traj_id, ~ sum(calls$traj_id == .x)),
+            `cross-sectional VAF %` = round(100 * AF, 2)) %>%
+  knitr::kable()
+```
+
+
+# 9. Counts after each step
+
+`samples (timepoints)`: longitudinal samples of the individuals left (each is a timepoint of every trajectory of
+its individual), plus, with `use_cross`, their cross-sectional samples from section 4 on. `detected timepoints` and
+`not detected timepoints` are trajectory x sample combinations; in the final table the not detected ones carry
+the imputed VAF.
+
+```{r step-counts}
+knitr::kable(step_counts)
+```
+
+
+# 10. Final table
+
+One row per trajectory and timepoint. Columns:
+
+- `ID`, demographics (`BORN` to `CV_SMOKED`), `traj_id`, `LABDATE`, `N_CHIP` (trajectories of the individual).
+- Annotation (`AAChange.refGene` to `cosmic70`, `Variant`), the same at every row of a trajectory: from its
+  Mutect2 calls (VCF coordinates) or, for a variant called only in the cross-sectional screening, from that call
+  (ANNOVAR coordinates).
+- Measurement: `GT`, `AD`, `AF`, `DP`, `F1R2`, `F2R1`. `AD` and `DP` of a bam-readcount timepoint are the pileup
+  counts; an imputed timepoint has only `AF`.
+- `type`: `long` (longitudinal sequencing) or `cross` (cross-sectional screening, only with `use_cross`).
+  `source`: `original` (a call),
+  `bam_readcount` or `imputed`.
+- `LABYEAR`, `Age`, `Sample`.
+- `lod_depth` and `lod_alt_reads` (read counts behind the LoD: the call's at a call, the pileup's otherwise),
+  `lod_vaf`, `lod_status`, and `traj_lod_mean`, `traj_lod_sd` (section 8.1).
+
+```{r final-table}
+my_chip_calls_filtered2 <- my_chip_calls_imputed %>%
+  group_by(ID) %>%
+  mutate(N_CHIP = n_distinct(traj_id)) %>%
+  ungroup() %>%
+  left_join(pat %>% select(-BORN), by = "ID") %>%
+  mutate(AD      = ifelse(source == "bam-readcount", paste(n - k, k, sep = ","), AD),
+         DP      = ifelse(source == "bam-readcount", n, DP),
+         source  = case_when(source %in% c("Mutect2", "cross-sectional") ~ "original",
+                             source == "bam-readcount"                   ~ "bam_readcount",
+                             TRUE                                        ~ source),
+         LABDATE = as.character(LABDATE)) %>%
+  transmute(ID, BORN, SEX, GENETIC_SEX, ETHNICITY, HIV_POSDATE, IVD, RISK, CV_SMOKED, traj_id, LABDATE, N_CHIP,
+            AAChange.refGene, Gene.refGene, Chr, Start, End, Ref, Alt, Func.refGene, GeneDetail.refGene,
+            ExonicFunc.refGene, cosmic70, GT, AD, AF, DP, F1R2, F2R1, Variant, type, source, LABYEAR, Age,
+            Sample, lod_depth = n, lod_alt_reads = k, lod_vaf, lod_status = as.character(lod_status),
+            traj_lod_mean = lod_mean, traj_lod_sd = lod_sd) %>%
+  arrange(ID, traj_id, LABDATE)
+stopifnot(!anyNA(my_chip_calls_filtered2$AF), !anyNA(my_chip_calls_filtered2$Age))
+
+table(type = my_chip_calls_filtered2$type, source = my_chip_calls_filtered2$source)
+```
+
+```{r save-final}
+write.table(my_chip_calls_filtered2, "resources/chip_calls_long_filtered.txt", sep="\t", quote = F, row.names = F)
+```
+
+Two intermediate tables that the paper does not use (`chip_calls_long_not_filtered.txt`,
+`chip_calls_long_rerun.txt`): all Mutect2 calls kept in
+section 1, in the columns of `chip_calls.csv` with the annotation of the called allele (section 1.2; the transcript
+columns `Accession`, `transcriptOI`, `NonsynOI` belong to the annotation in the file and are left out), and the
+trajectories of section 5 (Mutect2 calls, cross-sectional calls with `use_cross`, not detected timepoints at
+`AF = 0`).
+
+```{r save-intermediate}
+chip_calls_long_not_filtered <- chip_calls_file %>%
+  filter(X %in% calls$X) %>%
+  select(-Accession, -transcriptOI, -NonsynOI) %>%
+  rows_update(calls %>%
+                distinct(X) %>%
+                left_join(annot_check %>% select(X, all_of(paste0(dict_cols, "_allele"))), by = "X") %>%
+                rename_with(~ sub("_allele$", "", .x), -X),
+              by = "X") %>%
+  inner_join(calls %>% distinct(Sample, ID, LABDATE), by = "Sample") %>%
+  mutate(LABDATE = as.character(LABDATE)) %>%
+  select(-Sample)
+stopifnot(nrow(chip_calls_long_not_filtered) == nrow(calls))
+
+chip_calls_long_rerun <- grid_s5 %>%
+  transmute(ID, LABDATE = as.character(LABDATE), Gene.refGene, Chr, Start, End, Ref, Alt, Func.refGene,
+            GeneDetail.refGene, ExonicFunc.refGene, AAChange.refGene, cosmic70, GT, AD,
+            AF = ifelse(detected, AF, 0), DP, F1R2, F2R1, type, Variant, traj_id)
+
+write.table(chip_calls_long_not_filtered, "resources/chip_calls_long_not_filtered.txt", quote = F, row.names = F, sep="\t")
+write.table(chip_calls_long_rerun, "resources/chip_calls_long_rerun.txt", quote = F, sep="\t")
+```
+
+
+# 11. Plots and tables
+
+From `my_chip_calls_filtered2`. Shapes: filled circle: Mutect2 call; square: cross-sectional call (with `use_cross`); triangle:
+bam-readcount; open circle: imputed.
+
+```{r measurement}
+shape_final <- c("Mutect2" = 16, "cross-sectional" = 15, "bam-readcount" = 17, "imputed" = 1)
+if (!use_cross) shape_final <- shape_final[names(shape_final) != "cross-sectional"]
+
+my_chip_calls_filtered2 <- my_chip_calls_filtered2 %>%
+  mutate(measurement = factor(case_when(type == "cross"            ~ "cross-sectional",
+                                        source == "original"       ~ "Mutect2",
+                                        source == "bam_readcount"  ~ "bam-readcount",
+                                        TRUE                       ~ "imputed"), levels = names(shape_final)))
+```
+
+## 11.1 Trajectories
+
+```{r final-traj, fig.width=11, fig.height=7}
+pl <- my_chip_calls_filtered2 %>%
+  ggplot(aes(x=Age, y=AF, color=Gene.refGene, group=traj_id))+
+  geom_point(aes(shape = measurement), size=3)+
+  geom_line(linewidth = 1.3)+
+  scale_color_manual(values = gene_colors)+
+  scale_shape_manual(values = shape_final)+
+  facet_wrap(~ID, nrow = 7, ncol = 8)+
+  geom_hline(yintercept = 0.02, linewidth=0.6, linetype="dashed")+
+  theme_classic()+
+  ylab("Clone size")+
+  guides(color=guide_legend(title="CHIP gene"))
+
+pl
+
+ggsave("figures/CHIP_trajectories.png", plot = pl, dpi=300, width = 9, height = 5)
+```
+
+Detected timepoints only:
+
+```{r final-traj-detected, fig.width=11, fig.height=7}
+my_chip_calls_filtered2 %>%
+  filter(source != "imputed") %>%
+  ggplot(aes(x=Age, y=AF, color=Gene.refGene, group=traj_id))+
+  geom_point(aes(shape = measurement), size=3)+
+  geom_line(linewidth = 1.3)+
+  scale_color_manual(values = gene_colors)+
+  scale_shape_manual(values = shape_final)+
+  facet_wrap(~ID, nrow = 7, ncol = 8)+
+  geom_hline(yintercept = 0.02, linewidth=0.6, linetype="dashed")+
+  theme_classic()+
+  ylab("Clone size")+
+  guides(color=guide_legend(title="CH gene"))
+```
+
+```{r final-traj-log, fig.width=11, fig.height=7}
+my_chip_calls_filtered2 %>%
+  ggplot(aes(x=Age, y=log10(AF), color=Gene.refGene, group=traj_id))+
+  geom_point()+
+  geom_smooth(se=F)+
+  scale_color_manual(values = gene_colors)+
+  facet_wrap(~ID, nrow = 7, ncol = 9)+
+  geom_hline(yintercept = log10(0.02), linewidth=0.6, linetype="dashed")+
+  theme_classic()+
+  ggtitle("Individual CHIP variants trajectories")
+```
+
+```{r final-traj-filtered, fig.width=11, fig.height=7}
+gene_levels <- c("DNMT3A", "TET2", "ASXL1", "TP53", "PPM1D", "JAK2", "SF3B1", "SRSF2", "GNAS", "KRAS")
+stopifnot(all(my_chip_calls_filtered2$Gene.refGene %in% gene_levels))
+
+pl <- my_chip_calls_filtered2 %>%
+  mutate(Gene.refGene=factor(Gene.refGene, levels = gene_levels)) %>%
+  ggplot(aes(x=Age, y=AF, color=Gene.refGene, group=traj_id))+
+  geom_point(aes(shape = measurement), size=3)+
+  geom_line(linewidth = 1.3)+
+  scale_color_manual(values = gene_colors)+
+  scale_shape_manual(values = shape_final)+
+  facet_wrap(~ID, nrow = 7, ncol = 8)+
+  geom_hline(yintercept = 0.02, linewidth=0.6, linetype="dashed")+
+  theme_classic()+
+  ylab("Clone size")+
+  guides(color=guide_legend(title="CH gene"))
+
+pl
+
+ggsave("figures/CHIP_trajectories_filtered.png", plot = pl, dpi=300, width = 9, height = 5)
+```
+
+New IDs from `resources/SHCS_change_ids.txt`. Individuals of the set that are not in this file would be dropped
+by `merge()`; they get the next free numbers here (the file is not changed).
+
+```{r new-ids}
+new_ids <- read.table("resources/SHCS_change_ids.txt", sep = "\t", header = T)
+
+missing_ids <- setdiff(sort(unique(my_chip_calls_filtered2$ID)), new_ids$ID)
+missing_ids
+
+new_ids <- bind_rows(new_ids,
+                     tibble(ID = missing_ids,
+                            SHCS_ID_new = paste0("SHCS_", nrow(new_ids) + seq_along(missing_ids)))) %>%
+  mutate(SHCS_ID_new = factor(SHCS_ID_new, levels = paste0("SHCS_", 1:n())))
+
+c(individuals_in_file_not_in_set = length(setdiff(new_ids$ID, my_chip_calls_filtered2$ID)))
+```
+
+```{r final-traj-one-panel, fig.width=7, fig.height=5}
+pl <- my_chip_calls_filtered2 %>%
+  merge(new_ids, by="ID") %>%
+  mutate(Gene.refGene=factor(Gene.refGene, levels = gene_levels)) %>%
+  ggplot(aes(x=Age, y=AF, color=Gene.refGene, group=traj_id))+
+  geom_point(size=1.7)+
+  geom_line(linewidth = 1)+
+  scale_color_manual(values = gene_colors)+
+  geom_hline(yintercept = 0.02, linewidth=0.6, linetype="dashed")+
+  theme_classic()+
+  ylab("VAF (clone size)")+
+  guides(color=guide_legend(title="CHIP gene"))
+
+pl
+
+ggsave("figures/CHIP_trajectories_filtered_small.png", plot = pl, dpi=300, width = 6, height = 5)
+```
+
+```{r final-traj-new-ids, fig.width=12, fig.height=11}
+pl <- my_chip_calls_filtered2 %>%
+  merge(new_ids, by="ID") %>%
+  mutate(Gene.refGene=factor(Gene.refGene, levels = gene_levels)) %>%
+  ggplot(aes(x=Age, y=AF, color=Gene.refGene, group=traj_id))+
+  geom_point(size=1.5)+
+  geom_line(linewidth = 1)+
+  scale_color_manual(values = gene_colors)+
+  facet_wrap(~SHCS_ID_new, nrow = 8, ncol = 7, scale="free")+
+  geom_hline(yintercept = 0.02, linewidth=0.6, linetype="dashed")+
+  theme_classic()+
+  ylab("VAF (clone size)")+
+  guides(color=guide_legend(title="CHIP gene"))
+
+pl
+
+ggsave("figures/CHIP_trajectories_filtered2.png", plot = pl, dpi=300, width = 9, height = 7)
+ggsave("figures/CHIP_trajectories_filtered_large.png", plot = pl, dpi=300, width = 10, height = 9)
+```
+
+
+## 11.2 Distribution of the CHIP variants
+
+One row per trajectory. The y axis of the bar plots runs to 30, or further if a count is larger.
+
+```{r variants}
+mut_levels <- c("splicing", "frameshift insertion", "frameshift deletion", "stopgain", "nonsynonymous SNV")
+
+traj_variants <- my_chip_calls_filtered2 %>%
+  filter(!is.na(ExonicFunc.refGene)) %>%
+  select(ID, Gene.refGene, traj_id, ExonicFunc.refGene) %>%
+  distinct() %>%
+  mutate(Gene.refGene=ifelse(Gene.refGene %in% c("GNAS", "JAK2", "SF3B1", "SRSF2", "KRAS"), "Other", Gene.refGene)) %>%
+  mutate(Gene.refGene=factor(Gene.refGene, levels = c("DNMT3A", "TET2", "ASXL1", "TP53", "PPM1D", "Other")))
+stopifnot(!anyDuplicated(traj_variants$traj_id), all(traj_variants$ExonicFunc.refGene %in% mut_levels))
+
+traj_variants %>%
+  group_by(Gene.refGene) %>%
+  summarise(N=n()) %>%
+  ungroup() %>%
+  mutate(Prop=N/sum(N))
+
+traj_variants %>%
+  mutate(ExonicFunc.refGene=factor(ExonicFunc.refGene, levels = mut_levels)) %>%
+  group_by(ExonicFunc.refGene) %>%
+  summarise(N=n()) %>%
+  ungroup() %>%
+  mutate(Prop=N/sum(N)) %>%
+  arrange(-N)
+```
+
+```{r variants-plots, fig.width=5, fig.height=4}
+count_axis <- function(N) {
+  top <- max(30, 5 * ceiling(max(N) / 5))
+  scale_y_continuous(name="Count", breaks=seq(0,top,5), limits = c(0,top))
+}
+
+gene_counts <- traj_variants %>%
+  group_by(Gene.refGene) %>%
+  summarise(N=n()) %>%
+  ungroup() %>%
+  mutate(Prop=N/sum(N))
+
+gene <- gene_counts %>%
+  ggplot(aes(x=Gene.refGene, y=N, fill=Gene.refGene))+
+  geom_col(color="black")+
+  count_axis(gene_counts$N)+
+  xlab("")+
+  theme_classic()+
+  theme(axis.text.x = element_text(size=15, angle = 45, hjust = 1, face = "italic"),
+        axis.title.y = element_text(size=14),
+        axis.text.y = element_text(size=15),
+        legend.position = "None")
+
+mut_counts <- traj_variants %>%
+  mutate(ExonicFunc.refGene=factor(ExonicFunc.refGene, levels = mut_levels)) %>%
+  group_by(ExonicFunc.refGene) %>%
+  summarise(N=n()) %>%
+  ungroup() %>%
+  mutate(Prop=N/sum(N))
+
+mut <- mut_counts %>%
+  ggplot(aes(x=reorder(ExonicFunc.refGene, -N), y=N, fill=ExonicFunc.refGene))+
+  geom_col(color="black")+
+  count_axis(mut_counts$N)+
+  xlab("")+
+  theme_classic()+
+  theme(axis.text.x = element_text(size=12, angle = 45, hjust = 1),
+        axis.title.y = element_text(size=14),
+        axis.text.y = element_text(size=15),
+        legend.position = "None")
+
+gene_mut_counts <- traj_variants %>%
+  mutate(ExonicFunc.refGene = replace(ExonicFunc.refGene, ExonicFunc.refGene == "nonsynonymous SNV", "missense"),
+         ExonicFunc.refGene = replace(ExonicFunc.refGene, ExonicFunc.refGene == "stopgain", "nonsense")) %>%
+  mutate(ExonicFunc.refGene=factor(ExonicFunc.refGene, levels = c("splicing", "frameshift insertion", "frameshift deletion", "nonsense","missense"))) %>%
+  group_by(Gene.refGene, ExonicFunc.refGene) %>%
+  summarise(N=n()) %>%
+  ungroup() %>%
+  mutate(Prop=N/sum(N))
+
+gene_mut <- gene_mut_counts %>%
+  ggplot(aes(x=Gene.refGene, y=N, fill=ExonicFunc.refGene, label=N))+
+  geom_col(color="black")+
+  count_axis(gene_counts$N)+
+  xlab("")+
+  geom_text(size = 3, position = position_stack(vjust = 0.5))+
+  theme_classic()+
+  theme(axis.text.x = element_text(size=15, angle = 45, hjust = 1, face = "italic"),
+        axis.title.y = element_text(size=14),
+        axis.text.y = element_text(size=15))+
+  guides(fill=guide_legend(title="Mutation type"))
+
+gene
+mut
+```
+
+```{r gene-mut-plot, fig.width=6, fig.height=4}
+gene_mut
+
+ggsave("figures/gene_distr.png", plot = gene, dpi=300, width = 5, height = 4)
+ggsave("figures/mut_distr.png", plot = mut, dpi=300, width = 5, height = 4)
+ggsave("figures/gene_mut_distr.png", plot = gene_mut, dpi=300, width = 6, height = 4)
+```
+
+
+## 11.3 Number of CHIP variants per individual
+
+```{r n-chip}
+my_chip_calls_filtered2 %>%
+  filter(!is.na(N_CHIP)) %>%
+  select(ID, N_CHIP) %>%
+  distinct() %>%
+  group_by(N_CHIP) %>%
+  summarise(N=n()) %>%
+  ungroup() %>%
+  mutate(Prop=N/sum(N))
+```
+
+```{r n-chip-plot, fig.width=5, fig.height=4}
+num_chip <- my_chip_calls_filtered2 %>%
+  filter(!is.na(N_CHIP)) %>%
+  select(ID, N_CHIP) %>%
+  distinct() %>%
+  ggplot(aes(x=N_CHIP))+
+  geom_bar(color="black", fill="grey", linewidth = 0.8)+
+  theme_classic()+
+  scale_y_continuous(name="Count", breaks=seq(0,40,10), limits = c(0,40))+
+  xlab("Number of CHIP variants per individual")+
+  theme(axis.text = element_text(size=15),
+        axis.title = element_text(size=14))
+
+num_chip
+
+ggsave("figures/num_chip.png", plot = num_chip, dpi=300, width = 5, height = 4)
+```
+
+
+## 11.4 Depth and LoD of every CHIP measurement
+
+One row per trajectory and timepoint of the final set, with the new ID of the individual (`SHCS_change_ids.txt`)
+in place of the SHCS ID, also in the trajectory name. Columns:
+
+- `SHCS_ID`, `Trajectory`, `Gene`, `Variant` (transcript of interest), `Chr`, `Position`, `Ref`, `Alt` (the
+  variant in VCF coordinates, so that it can be found without the annotation; ANNOVAR coordinates for a variant
+  called only in the cross-sectional screening), `Age`.
+- `Source`: Mutect2 call, bam-readcount timepoint, imputed (not detected, VAF = half the LoD of the timepoint) or,
+  with `use_cross`, cross-sectional call. Imputed rows are kept because they are part of the trajectories that are
+  analysed; filter on `Source` to drop them.
+- `Depth`, `Alt_reads`: the read counts behind the LoD (Mutect2's at a call, the pileup's otherwise).
+- `VAF`: the VAF of the trajectory (Mutect2's `AF` at a Mutect2 call, `Alt_reads / Depth` at a bam-readcount
+  timepoint, the imputed value otherwise).
+- `LoD`, and `Above_LoD` (`Alt_reads / Depth` >= LoD; empty for imputed rows), which says which measured values
+  are reliable at their depth.
+
+The sample barcode and the collection date are left out: `Age` places the timepoint, and the date would identify
+the participant.
+
+```{r variant-table}
+variant_table <- my_chip_calls_filtered2 %>%
+  left_join(new_ids, by = "ID") %>%
+  mutate(id_number = as.integer(sub("SHCS_", "", SHCS_ID_new))) %>%
+  arrange(id_number, traj_id, LABDATE, type) %>%
+  transmute(SHCS_ID    = as.character(SHCS_ID_new),
+            Trajectory = paste(SHCS_ID, Variant, sep = ":"),
+            Gene       = Gene.refGene,
+            Variant, Chr, Position = Start, Ref, Alt, Age,
+            Source     = measurement,
+            Depth      = lod_depth,
+            Alt_reads  = lod_alt_reads,
+            VAF        = round(AF, 5),
+            LoD        = round(lod_vaf, 5),
+            Above_LoD  = ifelse(measurement == "imputed", NA, lod_status == "VAF >= LoD"))
+stopifnot(nrow(variant_table) == nrow(my_chip_calls_filtered2), !anyNA(variant_table$SHCS_ID),
+          !anyNA(variant_table$Depth), !anyNA(variant_table$LoD))
+
+table(Source = variant_table$Source, Above_LoD = variant_table$Above_LoD, useNA = "ifany")
+
+head(variant_table, 15) %>% knitr::kable(caption = "First rows")
+
+write.table(variant_table, "results/SHCS_CHIP_variants_depth_LoD.txt", sep = "\t", quote = F, row.names = F)
+write.table(variant_table, file.path(paper_dir, "Tables", "SHCS_CHIP_variants_depth_LoD.txt"),
+            sep = "\t", quote = F, row.names = F)
+```
+
+
+## 11.5 Summary of the final trajectories
+
+Follow-up is the time from the first to the last timepoint (collection dates) of an individual or a trajectory.
+Measurements are the rows of the table of section 11.4.
+
+```{r trajectory-summary}
+fmt_dist <- function(x, digits = 0, scale = 1) {
+  x <- x * scale
+  q <- quantile(x, c(0.5, 0.25, 0.75))
+  sprintf("%.*f (IQR %.*f-%.*f; range %.*f-%.*f)", digits, q[1], digits, q[2], digits, q[3],
+          digits, min(x), digits, max(x))
+}
+n_of <- function(x, total) sprintf("%d (%.1f%%)", x, 100 * x / total)
+
+final_set <- my_chip_calls_filtered2 %>%
+  mutate(LABDATE = as.Date(LABDATE), detected = measurement != "imputed")
+
+per_traj <- final_set %>%
+  group_by(ID, traj_id) %>%
+  summarise(timepoints = n(), n_detected = sum(detected), max_vaf = max(AF[detected]),
+            followup = as.numeric(max(LABDATE) - min(LABDATE)) / 365.25, .groups = "drop")
+stopifnot(all(per_traj$max_vaf >= chip_vaf))
+
+per_ind <- final_set %>%
+  group_by(ID) %>%
+  summarise(trajectories = n_distinct(traj_id), samples = n_distinct(Sample),
+            followup = as.numeric(max(LABDATE) - min(LABDATE)) / 365.25, age_first = min(Age), .groups = "drop")
+
+n_traj <- nrow(per_traj)
+n_meas <- nrow(final_set)
+detected_meas <- final_set %>% filter(detected)
+
+traj_counts <- table(per_ind$trajectories)
+
+trajectory_summary <- bind_rows(
+  tibble(Group = "Individuals",
+         Characteristic = c("Individuals", "Trajectories per individual"),
+         Value = c(nrow(per_ind), fmt_dist(per_ind$trajectories))),
+  tibble(Group = "Individuals",
+         Characteristic = paste("Individuals with", names(traj_counts),
+                                ifelse(names(traj_counts) == "1", "trajectory", "trajectories")),
+         Value = n_of(as.integer(traj_counts), nrow(per_ind))),
+  tibble(Group = "Individuals",
+         Characteristic = c("Samples (timepoints)", "Samples per individual", "Follow-up per individual, years",
+                            "Age at the first sample, years"),
+         Value = c(n_distinct(final_set$Sample), fmt_dist(per_ind$samples), fmt_dist(per_ind$followup, 1),
+                   fmt_dist(per_ind$age_first))),
+  tibble(Group = "Trajectories",
+         Characteristic = c("Trajectories", "Timepoints per trajectory", "Detected timepoints per trajectory",
+                            "Follow-up per trajectory, years", "Maximum VAF per trajectory, %",
+                            "Trajectories with maximum VAF >= 10%"),
+         Value = c(n_traj, fmt_dist(per_traj$timepoints), fmt_dist(per_traj$n_detected),
+                   fmt_dist(per_traj$followup, 1), fmt_dist(per_traj$max_vaf, 1, 100),
+                   n_of(sum(per_traj$max_vaf >= 0.1), n_traj))),
+  final_set %>%
+    count(measurement, .drop = TRUE) %>%
+    transmute(Group = "Measurements", Characteristic = paste("Measurements:", measurement), Value = n_of(n, n_meas)),
+  tibble(Group = "Measurements",
+         Characteristic = c("Measurements", "Depth at the variant", "LoD, %",
+                            "Detected measurements with VAF >= LoD"),
+         Value = c(n_meas, fmt_dist(final_set$lod_depth), fmt_dist(final_set$lod_vaf, 2, 100),
+                   n_of(sum(detected_meas$lod_status == "VAF >= LoD"), nrow(detected_meas)))),
+  traj_variants %>%
+    count(Gene.refGene) %>%
+    transmute(Group = "Trajectories by gene", Characteristic = as.character(Gene.refGene), Value = n_of(n, n_traj)),
+  traj_variants %>%
+    count(ExonicFunc.refGene, sort = TRUE) %>%
+    transmute(Group = "Trajectories by mutation type", Characteristic = ExonicFunc.refGene, Value = n_of(n, n_traj)))
+stopifnot(sum(traj_variants$Gene.refGene %in% levels(traj_variants$Gene.refGene)) == n_traj)
+
+knitr::kable(trajectory_summary)
+
+write.table(trajectory_summary, "results/SHCS_CHIP_trajectories_summary.txt", sep = "\t", quote = F, row.names = F)
+write.table(trajectory_summary, file.path(paper_dir, "Tables", "SHCS_CHIP_trajectories_summary.txt"),
+            sep = "\t", quote = F, row.names = F)
+```
+
+
+## 11.6 Depth and LoD of CHIP and non-CHIP variants
+
+- **CHIP**: every longitudinal measurement of the final set (section 11.4): Mutect2 calls, bam-readcount and
+  imputed timepoints. The depth is Mutect2's at a call and the pileup's otherwise (they differ by about 2%,
+  section 1.3).
+- **non-CHIP**: every Mutect2 call in the same samples that is more than 1 bp away from all listed CHIP variants
+  (section 1.2), without the calls Mutect2 flags as `germline` or `multiallelic` and without chrY (the definition
+  of `01_per_sample_LoD_and_QC.Rmd`). Depth is Mutect2's `DP`.
+
+The LoD is calculated from the depth in the same way for both. It depends on depth only, so the comparison is one
+of sequencing depth at the two kinds of sites.
+
+```{r nonchip-calls}
+# DP and the alternate reads of AD of every record of a single-sample Mutect2 VCF; FORMAT differs between
+# records (phased ones carry PGT:PID:PS), so the fields are looked up by name
+read_mutect2_records <- function(sample) {
+  vcf <- read.table(gzfile(file.path("resources/mutect2_Calls/mutect2_output", paste0(sample, ".vcf.gz"))),
+                    sep = "\t", colClasses = c(V1 = "character", V4 = "character", V5 = "character",
+                                               V7 = "character", V9 = "character", V10 = "character"))
+  fmt <- strsplit(vcf$V9, ":", fixed = TRUE)
+  val <- strsplit(vcf$V10, ":", fixed = TRUE)
+  field <- function(name) mapply(function(f, v) v[match(name, f)], fmt, val)
+  tibble(Sample = sample, CHROM = vcf$V1, POS = vcf$V2, FILTER = vcf$V7, AD = field("AD"),
+         DP = as.integer(field("DP")))
+}
+
+final_samples <- unique(my_chip_calls_filtered2$Sample[my_chip_calls_filtered2$type == "long"])
+chip_window   <- unique(paste(annot_dict$Chr, c(annot_dict$Start - 1, annot_dict$Start, annot_dict$Start + 1)))
+
+nonchip_calls <- map_dfr(final_samples, read_mutect2_records) %>%
+  filter(!grepl("germline|multiallelic", FILTER), CHROM != "chrY", !paste(CHROM, POS) %in% chip_window) %>%
+  mutate(n = DP, k = as.integer(str_split_fixed(AD, ",", 3)[, 2])) %>%
+  filter(n > 0, k <= n) %>%
+  add_lod()
+
+# at a very low depth no VAF up to 0.5 reaches the target power, and the package returns no LoD
+c(non_CHIP_calls = nrow(nonchip_calls), samples = n_distinct(nonchip_calls$Sample),
+  without_LoD = sum(is.na(nonchip_calls$lod_vaf)))
+```
+
+```{r depth-lod-summary}
+chip_colors <- c("CHIP" = "#00BFC4", "non-CHIP" = "#F8766D")
+
+depth_lod <- bind_rows(
+  my_chip_calls_filtered2 %>% filter(type == "long") %>% transmute(group = "CHIP", depth = lod_depth, lod = lod_vaf),
+  nonchip_calls %>% transmute(group = "non-CHIP", depth = n, lod = lod_vaf)) %>%
+  mutate(group = factor(group, levels = names(chip_colors)))
+
+depth_lod %>%
+  group_by(group) %>%
+  summarise(observations = n(),
+            `depth, median (IQR)` = med_iqr(depth),
+            `depth, range` = paste(range(depth), collapse = "-"),
+            `LoD %, median (IQR)` = med_iqr(lod, 3, 100),
+            `LoD %, range` = paste(round(100 * range(lod, na.rm = TRUE), 3), collapse = "-"),
+            `LoD > 1%` = sum(lod > 0.01, na.rm = TRUE),
+            `no LoD (depth too low)` = sum(is.na(lod))) %>%
+  knitr::kable()
+```
+
+```{r depth-lod-plot, fig.width=8, fig.height=4}
+group_labels <- depth_lod %>%
+  count(group) %>%
+  mutate(label = paste0(group, "\n(n = ", n, ")"))
+group_labels <- setNames(group_labels$label, group_labels$group)
+
+p_depth <- ggplot(depth_lod, aes(x = group, y = depth, fill = group)) +
+  geom_violin(alpha = 0.6, colour = NA) +
+  geom_boxplot(width = 0.15, outlier.size = 0.4) +
+  scale_y_log10() +
+  scale_x_discrete(labels = group_labels) +
+  scale_fill_manual(values = chip_colors, guide = "none") +
+  labs(x = NULL, y = "Depth at the variant") +
+  theme_classic()
+
+p_lod <- ggplot(depth_lod %>% filter(!is.na(lod)), aes(x = group, y = lod, fill = group)) +
+  geom_violin(alpha = 0.6, colour = NA) +
+  geom_boxplot(width = 0.15, outlier.size = 0.4) +
+  scale_y_log10(labels = percent) +
+  scale_x_discrete(labels = group_labels) +
+  scale_fill_manual(values = chip_colors, guide = "none") +
+  labs(x = NULL, y = "Limit of detection (VAF)") +
+  theme_classic()
+
+pl <- ggarrange(p_depth, p_lod, ncol = 2, labels = c("A", "B"))
+pl
+
+ggsave("figures/SHCS_CHIP_nonCHIP_depth_LoD.png", plot = pl, dpi = 300, width = 8, height = 4)
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

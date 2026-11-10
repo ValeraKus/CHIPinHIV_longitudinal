@@ -1,0 +1,183 @@
+---
+title: "Table 1 and the supplementary tables S1-S12"
+author: "Valeriia Timonina"
+date: "2026-11-06"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+Collects the tables of the paper from the result files of the other notebooks, with the new participant
+ids, in the order in which they are cited in the text, and writes `Tables/Supplementary_Tables.xlsx` (one sheet per
+table, with a title row) and `Tables/Table1.txt` in `output/`. Tables S7 (factors against the trajectory
+statistics) and S8 (factors by cluster) are computed here.
+
+```{r libraries}
+source("R/paper_functions.R")
+library(writexl)
+calls <- load_calls(); meta <- load_meta(); ids <- load_ids(); sum_ <- load_sum(); cl <- load_final_clusters()
+res <- function(name) read_tsv_(file.path(rev$results, name))
+lab_map <- cluster_label_map(cl)
+```
+
+# Table 1
+
+```{r table1}
+ind <- calls %>% group_by(ID) %>% summarise(first_age = min(Age), last_age = max(Age), fup = max(Age) - min(Age), .groups = "drop") %>%
+  left_join(meta %>% select(-any_of(c("min_Age", "max_Age"))), by = "ID")
+stopifnot(nrow(ind) == 50)
+fmt_iqr <- function(x, d = 1) sprintf(paste0("%.", d, "f (%.", d, "f-%.", d, "f)"), median(x, na.rm = TRUE), quantile(x, 0.25, na.rm = TRUE), quantile(x, 0.75, na.rm = TRUE))
+fmt_pct <- function(x) sprintf("%d (%.1f%%)", sum(x, na.rm = TRUE), 100 * mean(x, na.rm = TRUE))
+table1 <- tibble(
+  Characteristic = c("Age at the first sample, years, median (IQR)", "Age at the last sample, years, median (IQR)", "Follow-up time, years, median (IQR)",
+                     "Duration of diagnosed HIV infection at the first sample, years, median (IQR)", "HIV RNA during follow-up, copies/mL, median (IQR)",
+                     "Nadir CD4, cells/µL, median (IQR)", "Nadir CD4 < 200 cells/µL, N (%)", "Males, N (%)", "White, N (%)", "Ever smoked, N (%)", "Injection drug users, N (%)"),
+  Value = c(fmt_iqr(ind$first_age), fmt_iqr(ind$last_age), fmt_iqr(ind$fup), fmt_iqr(ind$HIV_dur), fmt_iqr(ind$median_RNA_VL, 0),
+            fmt_iqr(ind$CD4_nadir), fmt_pct(ind$CD4_nadir < 200), fmt_pct(ind$SEX == 1), fmt_pct(ind$ETHNICITY == 1), fmt_pct(ind$CV_SMOKED == 1), fmt_pct(ind$IVD == 1)))
+knitr::kable(table1)
+write_res(table1, "Table1.txt", paper_copy = TRUE)
+```
+
+# Tables S7 and S8 (computed here)
+
+```{r tables-s7}
+meta2 <- meta %>% filter(ID %in% calls$ID) %>% mutate(CD4_nadir_less50 = as.numeric(CD4_nadir < 50), SEX = as.numeric(SEX == 1), ETHNICITY = as.numeric(ETHNICITY == 1),
+                                                    without_ART_years = without_ART_days / 365.25)
+stats4 <- c(mean_VAF = "mean VAF", max_VAF = "max VAF", mean_VAF_speed = "mean VAF speed", max_VAF_speed = "max VAF speed", mean_VAF_acceleration = "mean VAF acceleration",
+            Age_LoD2 = "age at LoD/2", Age_0.02 = "age at 2% VAF")
+factors4 <- c(SEX = "Male sex", CV_SMOKED = "Ever smoked", IVD = "Injection drug use", ETHNICITY = "White", CD4_nadir = "CD4 nadir, cells/µL",
+              without_ART_years = "Time diagnosed but untreated, years", TimeDetectRNA = "Time with detectable HIV RNA, years")
+d1 <- sum_ %>% left_join(meta2, by = "ID")
+tabS4 <- map_dfr(names(stats4), function(s) map_dfr(names(factors4), function(f) {
+  covars <- if (f == "SEX") "mean_Age" else "mean_Age + SEX"
+  dd <- d1 %>% filter(!is.na(.data[[s]]), !is.na(.data[[f]]))
+  m_lm <- lm(as.formula(paste(s, "~", f, "+", covars)), data = dd)
+  m_me <- tryCatch(lmer(as.formula(paste(s, "~", f, "+", covars, "+ (1 | ID)")), data = dd), error = function(e) NULL)
+  co <- summary(m_lm)$coefficients
+  cm <- if (!is.null(m_me)) summary(m_me)$coefficients else NULL
+  tibble(Statistic = stats4[[s]], Factor = factors4[[f]], Trajectories = nobs(m_lm),
+         `Coefficient (linear model)` = co[f, "Estimate"], `p (linear model)` = co[f, "Pr(>|t|)"],
+         `Coefficient (random intercept per person)` = if (!is.null(cm)) cm[f, "Estimate"] else NA, `p (mixed model)` = if (!is.null(cm)) cm[f, "Pr(>|t|)"] else NA)
+})) %>% mutate(`p FDR (linear model)` = p.adjust(`p (linear model)`, "BH"), `p FDR (mixed model)` = p.adjust(`p (mixed model)`, "BH")) %>%
+  mutate(across(where(is.numeric) & !Trajectories, ~ signif(.x, 3)))
+write_res(tabS4, "tableS_factors_vs_statistics.txt")
+knitr::kable(tabS4 %>% filter(`p (linear model)` < 0.05 | `p (mixed model)` < 0.05))
+```
+
+```{r tables-s8}
+vars_num <- c(CD4_nadir = "CD4 nadir, cells/µL", without_ART_years = "Time diagnosed but untreated, years", TimeDetectRNA = "Time with detectable HIV RNA, years", HIV_dur = "Duration of diagnosed HIV infection at the first sample, years")
+vars_bin <- c(SEX = "Male sex", ETHNICITY = "White", IVD = "Injection drug use", CV_SMOKED = "Ever smoked", CD4_nadir_less50 = "CD4 nadir < 50 cells/µL")
+compare_k <- function(d, level_name) {
+  d$cluster <- droplevels(cluster_factor(d$cluster, cl))
+  k <- nlevels(d$cluster)
+  bind_rows(
+    map_dfr(names(vars_num), function(v) {
+      med <- d %>% group_by(cluster) %>% summarise(x = sprintf("%.1f (n = %d)", median(.data[[v]], na.rm = TRUE), sum(!is.na(.data[[v]]))), .groups = "drop")
+      p <- if (k == 2) wilcox.test(d[[v]] ~ d$cluster, exact = FALSE)$p.value else kruskal.test(d[[v]] ~ d$cluster)$p.value
+      tibble(Level = level_name, Factor = vars_num[[v]], !!!setNames(as.list(med$x), as.character(med$cluster)), Test = if (k == 2) "Wilcoxon" else "Kruskal-Wallis", p = p)
+    }),
+    map_dfr(names(vars_bin), function(v) {
+      sh <- d %>% group_by(cluster) %>% summarise(x = sprintf("%d/%d (%.0f%%)", sum(.data[[v]] == 1, na.rm = TRUE), sum(!is.na(.data[[v]])), 100 * mean(.data[[v]] == 1, na.rm = TRUE)), .groups = "drop")
+      tibble(Level = level_name, Factor = vars_bin[[v]], !!!setNames(as.list(sh$x), as.character(sh$cluster)), Test = "Fisher", p = fisher.test(table(d[[v]], d$cluster))$p.value)
+    })) %>% mutate(`p FDR` = p.adjust(p, "BH"))
+}
+traj_level <- sum_ %>% select(ID, traj_id) %>% inner_join(cl %>% select(traj_id, cluster), by = "traj_id") %>% left_join(meta2, by = "ID")
+person_level <- sum_ %>% inner_join(cl %>% select(traj_id, cluster), by = "traj_id") %>% group_by(ID) %>% slice_max(mean_VAF, n = 1, with_ties = FALSE) %>% ungroup() %>%
+  select(ID, cluster) %>% left_join(meta2, by = "ID")
+single_ids <- sum_ %>% count(ID) %>% filter(n == 1) %>% pull(ID)
+single_level <- person_level %>% filter(ID %in% single_ids)
+tabS5 <- bind_rows(compare_k(traj_level, "trajectory (71 trajectories)"), compare_k(person_level, "person (50 persons; the cluster of the largest clone)"),
+                   compare_k(single_level, sprintf("person with a single trajectory (%d persons)", nrow(single_level)))) %>%
+  mutate(p = signif(p, 2), `p FDR` = signif(`p FDR`, 2))
+knitr::kable(tabS5)
+write_res(tabS5, "tableS_clusters_vs_factors.txt")
+```
+
+# All supplementary tables
+
+```{r tables}
+sheets <- list()
+add_sheet <- function(name, title, df) {
+  df <- df %>% mutate(across(everything(), as.character))
+  out <- bind_rows(tibble(!!!setNames(as.list(c(title, rep("", ncol(df) - 1))), names(df))),
+                   tibble(!!!setNames(as.list(rep("", ncol(df))), names(df))),
+                   tibble(!!!setNames(as.list(names(df)), names(df))), df)
+  sheets[[name]] <<- out
+}
+# S1: all measurements
+s1 <- read_tsv_("results/SHCS_CHIP_variants_depth_LoD.txt") %>%
+  transmute(Participant = SHCS_ID, Gene, Variant = short_variant(Trajectory, Gene), Chr, Position, Ref, Alt, Age,
+            Source = recode(Source, Mutect2 = "Mutect2 call", `bam-readcount` = "read pile-up", imputed = "not detected (LoD/2)"), Depth, `Variant reads` = Alt_reads, VAF, LoD, `Above LoD` = Above_LoD)
+add_sheet("Table S1", "Table S1. Every measurement of the 71 CHIP trajectories: source (Mutect2 call, variant reads in the read pile-up at a timepoint without a call, or not detected and set to LoD/2), depth at the variant, variant reads, VAF and the limit of detection of the timepoint.", s1)
+# S2-S4: spline settings, simulation, hold-out error
+ov <- res("sensitivity_overview.txt") %>% filter(analysis %in% c("main analysis", "spline setting")) %>%
+  select(-any_of(c("Fabre p")))
+add_sheet("Table S2", "Table S2. Which results hold under which spline setting: the nine alternative smooth.spline settings against the main analysis (REML spline). Gene order of the mean VAF speed, Pearson r with the gene fitness effects of Fabre et al. 2022, adjusted Rand index of the consensus clusters, share of trajectories with the same sign of the mean speed and of the mean acceleration, and the Spearman rho of each per-trajectory statistic with the main analysis.", ov)
+sim <- res("simulation_REML_errors.txt") %>% filter(spline == "REML") %>% select(-spline)
+add_sheet("Table S3", "Table S3. Simulation study: recovery of the mean speed and of the mean acceleration by the REML spline from simulated clones of known fitness s sampled every 1, 2, 3 or 5 years at a depth of 2,000 reads (100 clones per value of s; reference: the REML spline fitted to the noise-free VAF of every year).", sim)
+add_sheet("Table S4", "Table S4. Hold-out error of the internal measurements (231 points) for the nine smooth.spline settings, the REML spline and linear interpolation: median and mean of |prediction - measurement| / VAF range of the trajectory, and the median effective degrees of freedom.", res("spline_holdout_errors.txt"))
+# S5: co-occurring pairs (clusters relabelled to the final clusters); S6: number of clusters
+pairs <- res("figS6_pairs_full.txt") %>%
+  mutate(cl1 = lab_map[as.character(cl$cluster[match(traj_1, cl$traj_id)])], cl2 = lab_map[as.character(cl$cluster[match(traj_2, cl$traj_id)])]) %>%
+  transmute(Participant = SHCS_ID_new, `Variant 1` = variant_1, `Variant 2` = variant_2, `Shared ages` = shared_ages, `Shared timepoints` = n_shared_timepoints,
+            `r curves` = round(r_curves, 2), `r speed` = round(r_speed, 2), `r measured VAF` = round(r_measured, 2), `Direction 1 / 2` = paste(direction_1, direction_2, sep = " / "),
+            `Max VAF 1 / 2 (%)` = sprintf("%.1f / %.1f", 100 * max_VAF_1, 100 * max_VAF_2), `Max |z|` = round(max_abs_z, 1), `Within read noise` = ifelse(within_read_noise, "yes", "no"),
+            `Max sum of cell fractions` = round(max_cell_fraction_sum, 2), `Gap of first detection, years` = first_detection_gap_years, `Cluster 1 / 2` = paste(cl1, cl2, sep = " / "), Call = call)
+write_res(pairs, "tableS_cooccurring_pairs.txt", paper_copy = TRUE)
+add_sheet("Table S5", "Table S5. All pairs of co-occurring CHIP trajectories in the 16 participants with several variants. r: Spearman correlation of the REML curves, of their speeds and of the measured VAFs over the shared ages; direction: net change of each curve over the shared ages; max |z|: largest difference between the two measured VAFs at a shared timepoint in units of its binomial standard error; max sum of cell fractions: largest value of 2 VAF1 + 2 VAF2 (above 1 the variants must share cells). Calls: parallel with similar size (putative co-clonal), parallel with nested sizes (putative subclone or co-expanding), divergent (putative competing), sequential (second variant detected 5 or more years later), unclear.", pairs)
+ks <- res("clusters_k_scan.txt") %>%
+  transmute(k, `Cluster sizes` = sizes, PAC = signif(PAC, 3), Silhouette = signif(Sil, 3), `Score function` = signif(SF, 3), `Calinski-Harabasz` = signif(CH, 4),
+            `Davies-Bouldin` = signif(DB, 3), `Davies-Bouldin*` = signif(DBstar, 3), Dunn = signif(D, 3), COP = signif(COP, 3))
+add_sheet("Table S6", "Table S6. Choice of the number of clusters k of the consensus DTW clustering: the proportion of ambiguous co-assignments (PAC) of the consensus of 40 runs for each k and the median internal cluster validity indices of these runs (cvi() of dtwclust): higher is better for the silhouette, score function, Calinski-Harabasz and Dunn indices, lower for Davies-Bouldin, Davies-Bouldin* and COP (COP decreases with k and was not used). k = 3 was retained; the final partition is the consensus of 100 runs.", ks)
+# S7, S8
+add_sheet("Table S7", "Table S7. Demographic and HIV-related factors against the summary statistics of the 71 CHIP trajectories (REML curves): mean and maximal VAF, mean and maximal VAF speed, mean VAF acceleration, age at LoD/2 and age at 2% VAF. Each row is one linear model of the statistic on the factor with mean age and sex as covariates (one row per trajectory), and the same model with a random intercept per person. p FDR: Benjamini-Hochberg over the 49 tests of each model type.", tabS4)
+add_sheet("Table S8", "Table S8. Demographic and HIV-related factors by trajectory cluster (consensus DTW clusters: shrinking, stable, growing), at the trajectory level, at the person level (each person assigned to the cluster of their largest clone) and among the persons with a single trajectory. Medians for continuous factors (Kruskal-Wallis test), counts and proportions for binary factors (Fisher test).", tabS5)
+# S9: blood
+s6 <- res("fig3_blood_models.txt") %>% filter(version == "sequenced timepoints") %>%
+  transmute(Version = version, Outcome = recode(outcome, VAF = "log10 VAF", VAF_speed = "VAF speed", VAF_acceleration = "VAF acceleration"),
+            Parameter = blood_labels[parameter], Estimate = signif(estimate, 3), `CI lower` = signif(conf.low, 3), `CI upper` = signif(conf.high, 3), p = signif(p.value, 2), Rows = n, Persons = n_persons)
+s6b <- res("fig3_blood_models_by_gene_cluster.txt") %>%
+  transmute(Version = paste("sequenced timepoints,", ifelse(level == "gene", "gene", ""), group), Outcome = recode(outcome, VAF = "log10 VAF", VAF_speed = "VAF speed", VAF_acceleration = "VAF acceleration"),
+            Parameter = blood_labels[parameter], Estimate = signif(estimate, 3), `CI lower` = signif(conf.low, 3), `CI upper` = signif(conf.high, 3), p = signif(p.value, 2), Rows = n, Persons = n_persons)
+add_sheet("Table S9", "Table S9. Mixed models of the CHIP trajectory of the largest clone of each person (log10 VAF, VAF speed, VAF acceleration of the REML curve) on one blood parameter (log10) at a time, at the sequenced timepoints after ART start (random intercept per person), and the gene- and cluster-specific models. Each model is adjusted for age (z-score) and the age x parameter interaction. PLT: platelet count.", bind_rows(s6, s6b))
+# S10: the two cohorts
+s7 <- res("cohort_characteristics_SHCS_SardiNIA.txt") %>%
+  bind_rows(tribble(~Characteristic, ~SHCS, ~SardiNIA,
+                    "Ascertainment", "CHIP carriers at a screening after age 60 with at least 20 years of stored PBMC", "Population cohort; all variants of the panel followed over the study phases",
+                    "Sample", "PBMC", "Blood DNA (Fabre et al. 2022)",
+                    "Assay", "Twist hybrid capture, 24 CHIP genes; Mutect2 calls and read pile-up", "Targeted panel of Fabre et al. 2022; read counts per variant and phase",
+                    "Inclusion of a trajectory", "At least two detected timepoints (at least one variant read), at least one of them above the LoD, at least one timepoint at or above 2% VAF, at least three timepoints", "Same rule",
+                    "Ancestry", "90% white", "Sardinian founder population"))
+add_sheet("Table S10", "Table S10. The two cohorts as analysed: all CHIP trajectories that meet the trajectory definition. The comparisons of the cohorts use the trajectories in the five main genes.", s7)
+# S11, S12: cohort comparison
+s8a <- res("fig4_cohort_wilcoxon_tests.txt") %>%
+  transmute(Set = set, Statistic = statistic, `n SHCS` = n_SHCS, `n SardiNIA` = n_SardiNIA, `Median SHCS` = signif(median_SHCS, 3), `Median SardiNIA` = signif(median_SardiNIA, 3), p = signif(p, 2), `p FDR` = signif(p_BH, 2))
+s8b <- res("fig4_mixed_models_coefficients.txt") %>%
+  filter(Term %in% c("Age", "HIV", "Age:HIV")) %>%
+  mutate(set = set_labels[sub("\\..*", "", label)],
+         group = ifelse(level == "cluster", paste(lab_map[sub("^[a-z_]+\\.([0-9])$", "\\1", label)], "cluster"), sub("^[a-z_]+\\.([A-Za-z0-9]+)\\..*", "\\1", label)),
+         model = ifelse(grepl("zero$", label) | level == "cluster", "age + cohort", "age x cohort")) %>%
+  transmute(Set = set, Group = group, Model = model, Trajectories = trajectories, Measurements = measurements, Term = Term, Estimate = signif(Estimate, 3),
+            `CI lower` = signif(`CI Lower`, 3), `CI upper` = signif(`CI Upper`, 3), p = signif(`p-value`, 2))
+ss <- res("mixed_models_sex_smoking.txt") %>% filter(term == "CohortSHCS") %>%
+  transmute(Set = set_labels[c(unmatched = "unmatched", matched_age_filtered = "matched_filtered")[set]], Group = "All", Model = model, Trajectories = n_traj, Measurements = n_meas, Term = "HIV",
+            Estimate = signif(estimate, 3), `CI lower` = signif(conf.low, 3), `CI upper` = signif(conf.high, 3), p = signif(p.value, 2)) %>% filter(Model != "age + cohort")
+add_sheet("Table S11", "Table S11. Mixed models of log10 VAF on age (centred at 65 years) and cohort (HIV = SHCS vs SardiNIA) with a random intercept and slope per trajectory, on the fitted curve at the sequenced timepoints of the trajectories in the five main genes: all trajectories, by gene and by cluster, in the four matching sets, without and with the age x cohort interaction, and with sex and smoking as covariates or within each sex.", bind_rows(s8b, ss))
+add_sheet("Table S12", "Table S12. Wilcoxon tests of the per-trajectory summary statistics between SHCS (PWH) and SardiNIA in the four matching sets (five main genes). p FDR: Benjamini-Hochberg within each set.", s8a)
+names(sheets)
+write_xlsx(sheets, file.path(paper$tables, "Supplementary_Tables.xlsx"), col_names = FALSE)
+write_xlsx(sheets, file.path(rev$results, "Supplementary_Tables.xlsx"), col_names = FALSE)
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

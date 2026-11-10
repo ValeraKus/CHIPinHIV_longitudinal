@@ -1,0 +1,243 @@
+---
+title: "SHCS and SardiNIA trajectories: matching, trajectory-specific LoD"
+author: "Valeriia Timonina"
+date: "2026-11-03"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+params:
+  cross_sectional: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+```
+
+```{r paths}
+# cross_sectional = TRUE: the SHCS trajectories with the cross-sectional calls, read from and written to their own folders
+lod_sub <- if (params$cross_sectional) "LoD/cross_sectional" else "LoD"
+resources_lod <- file.path("resources", lod_sub)
+results_lod   <- file.path("results", lod_sub)
+figures_lod   <- file.path("figures", lod_sub)
+for (d in c(resources_lod, results_lod, figures_lod)) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+shcs_calls_file <- if (params$cross_sectional) file.path(resources_lod, "chip_calls_long_filtered.txt") else "resources/chip_calls_long_filtered.txt"
+```
+
+`r if (params$cross_sectional) "**Sensitivity analysis: this run uses the SHCS trajectories that include the cross-sectional calls.** The paths named in the text are those of the main analysis; this run reads and writes the folders cross_sectional under them."`
+
+
+The SHCS trajectories are matched to SardiNIA trajectories on the curves of
+`2_trajectory_models/01_spline_fits.Rmd` (VAF floored at LoD / 2 of the trajectory). The notebook writes
+the four sets of the comparison to `resources/LoD/`:
+
+- **unmatched**: all trajectories of the 5 genes;
+- **unmatched, age filtered**: the ages that both cohorts cover;
+- **matched**: every SHCS trajectory with one SardiNIA trajectory of the same gene, the same variant if possible, and then the widest age range
+  around the SHCS trajectory;
+- **matched, age filtered**: the ages that the two trajectories of a pair have in common.
+
+# Load the data
+
+```{r}
+main_genes <- c("DNMT3A", "TET2", "ASXL1", "PPM1D", "TP53")
+
+shcs_all <- read.table(file.path(resources_lod, "SHCS_predicted_trajectories_derivatives.txt"), sep = "\t", header = TRUE) %>%
+  rename(Gene = Gene.refGene) %>%
+  mutate(ID = as.character(ID), Cohort = "SHCS")
+
+sardinia_all <- read.table(file.path(resources_lod, "Sardinia_predicted_trajectories_derivatives.txt"), sep = "\t", header = TRUE) %>%
+  rename(Gene = Gene.refGene) %>%
+  mutate(Cohort = "Sardinia")
+
+shcs_pred_trajectories <- shcs_all %>% filter(Gene %in% main_genes)
+sardinia_pred_trajectories <- sardinia_all %>% filter(Gene %in% main_genes)
+
+bind_rows(shcs_pred_trajectories, sardinia_pred_trajectories) %>%
+  group_by(Cohort) %>%
+  summarise(individuals = n_distinct(ID), trajectories = n_distinct(traj_id), `age, range` = paste(range(Age), collapse = "-")) %>%
+  knitr::kable()
+```
+
+# Matching
+
+The SHCS trajectories are taken one by one (ordered by `traj_id`). Among the SardiNIA trajectories of the same gene not yet used, the one with
+the same variant is taken if there is one, and then the one with the largest `min_Age_dif + max_Age_dif`, the years it extends beyond
+the SHCS trajectory on either side. `build_sets()` matches and makes the four sets.
+
+```{r}
+# age range of each trajectory; `variant`: the name of the variant without the individual, with the gene also for splice variants
+traj_sum <- function(pred) {
+  pred %>%
+    group_by(traj_id) %>%
+    summarise(min_Age = min(Age), max_Age = max(Age), Gene = first(Gene), .groups = "drop") %>%
+    mutate(variant = sub("^[^:]+:", "", traj_id),
+           variant = ifelse(grepl("^NM", variant), paste(Gene, variant, sep = ":"), variant))
+}
+
+build_sets <- function(shcs_pred, sard_pred) {
+  shcs_sum <- traj_sum(shcs_pred)
+  sardinia_sum <- traj_sum(sard_pred)
+
+  shcs_sum$index <- seq_len(nrow(shcs_sum))
+  sardinia_sum$matched <- FALSE
+  sardinia_matched <- NULL
+  shcs_unmatched <- NULL
+
+  for (i in shcs_sum$index) {
+    one_traj <- shcs_sum[i, ]
+    candidate_traj <- sardinia_sum %>% filter(!matched, Gene == one_traj$Gene)
+
+    if (nrow(candidate_traj) == 0) {
+      shcs_unmatched <- rbind(shcs_unmatched, one_traj)
+    } else {
+      res <- candidate_traj %>%
+        mutate(exact_var = as.numeric(variant == one_traj$variant),
+               min_Age_dif = -(min_Age - one_traj$min_Age),
+               max_Age_dif = max_Age - one_traj$max_Age,
+               score = min_Age_dif + max_Age_dif) %>%
+        arrange(-exact_var, -score) %>%
+        slice(1)
+      sardinia_matched <- rbind(sardinia_matched, res %>% select(traj_id, min_Age, max_Age, Gene, variant, exact_var) %>% mutate(index = i))
+      sardinia_sum$matched[sardinia_sum$traj_id == res$traj_id] <- TRUE
+    }
+  }
+
+  pairs <- sardinia_matched %>%
+    left_join(shcs_sum %>% select(index, shcs_traj_id = traj_id, shcs_min_Age = min_Age, shcs_max_Age = max_Age), by = "index")
+
+  unmatched <- bind_rows(sard_pred, shcs_pred)
+
+  unmatched_filtered <- unmatched %>%
+    group_by(Cohort) %>%
+    mutate(min_Age = min(Age), max_Age = max(Age)) %>%
+    ungroup() %>%
+    mutate(max_min_Age = max(min_Age), min_max_Age = min(max_Age)) %>%
+    filter(Age >= max_min_Age & Age <= min_max_Age)
+
+  matched_all <- bind_rows(
+    shcs_pred %>% inner_join(shcs_sum %>% select(traj_id, min_Age, max_Age, index), by = "traj_id"),
+    sard_pred %>% inner_join(sardinia_matched %>% select(traj_id, min_Age, max_Age, index), by = "traj_id"))
+
+  # an SHCS trajectory without a partner has no pair to compare and stays out of the matched sets
+  matched <- matched_all %>% filter(index %in% sardinia_matched$index)
+
+  matched_filtered <- matched %>%
+    group_by(index) %>%
+    mutate(min_Age_both = max(min_Age), max_Age_both = min(max_Age)) %>%
+    ungroup() %>%
+    filter(Age >= min_Age_both & Age <= max_Age_both)
+
+  list(sets = list(unmatched = unmatched, `unmatched, age filtered` = unmatched_filtered, matched = matched, `matched, age filtered` = matched_filtered),
+       pairs = pairs, n_shcs_without_partner = if (is.null(shcs_unmatched)) 0L else nrow(shcs_unmatched), n_sardinia_left = sum(!sardinia_sum$matched))
+}
+
+set_table <- function(sets) {
+  imap_dfr(sets, function(d, name) {
+    d %>%
+      group_by(Cohort) %>%
+      summarise(set = name, trajectories = n_distinct(traj_id), `curve points` = n(), `age, range` = paste(range(Age), collapse = "-"),
+                `age, median` = median(Age), .groups = "drop")
+  }) %>%
+    relocate(set) %>%
+    knitr::kable()
+}
+
+res_main <- build_sets(shcs_pred_trajectories, sardinia_pred_trajectories)
+
+res_main$pairs %>%
+  group_by(Gene) %>%
+  summarise(pairs = n(), `same variant` = sum(exact_var),
+            `SardiNIA trajectory covers the SHCS ages` = sum(min_Age <= shcs_min_Age & max_Age >= shcs_max_Age),
+            `ages in common, none` = sum(pmin(max_Age, shcs_max_Age) < pmax(min_Age, shcs_min_Age)),
+            .groups = "drop") %>%
+  bind_rows(summarise(., Gene = "All", across(where(is.numeric), sum))) %>%
+  knitr::kable(caption = "Matched pairs")
+
+c(SHCS_trajectories_without_a_partner = res_main$n_shcs_without_partner, SardiNIA_trajectories_left = res_main$n_sardinia_left)
+```
+
+# The four sets
+
+```{r}
+sets <- res_main$sets
+unmatched <- sets$unmatched
+matched <- sets$matched
+
+set_table(sets)
+```
+
+Curves of the four sets on a linear scale, and of the unmatched set with the VAF on a log scale, which shows the part near the LoD:
+
+```{r, fig.width=11, fig.height=7}
+hiv_colors <- c("SHCS" = "red3", "Sardinia" = "grey44")
+
+for (name in names(sets)) {
+  print(sets[[name]] %>%
+          ggplot(aes(x = Age, y = VAF, group = traj_id, color = Cohort)) +
+          geom_line() +
+          scale_color_manual(values = hiv_colors) +
+          theme_classic() +
+          geom_hline(yintercept = 0.02, linetype = "dashed") +
+          facet_wrap(~Gene) +
+          ggtitle(name))
+}
+
+sets$unmatched %>%
+  ggplot(aes(x = Age, y = VAF, group = traj_id, color = Cohort)) +
+  geom_line() +
+  scale_color_manual(values = hiv_colors) +
+  scale_y_log10() +
+  theme_classic() +
+  geom_hline(yintercept = 0.02, linetype = "dashed") +
+  facet_wrap(~Gene) +
+  ggtitle("unmatched, log scale")
+```
+
+```{r, fig.width=11, fig.height=4}
+for (v in c("VAF_speed", "VAF_acceleration")) {
+  print(bind_rows(unmatched %>% mutate(set = "unmatched"), matched %>% mutate(set = "matched")) %>%
+          mutate(set = factor(set, levels = c("unmatched", "matched"))) %>%
+          ggplot(aes(x = Age, y = .data[[v]], group = traj_id, color = Cohort)) +
+          geom_line() +
+          scale_color_manual(values = hiv_colors) +
+          theme_classic() +
+          geom_hline(yintercept = 0, linetype = "dashed") +
+          facet_grid(set ~ Gene))
+}
+```
+
+# Write the result
+
+```{r}
+write_sets <- function(sets, suffix = "") {
+  files <- c(`unmatched` = "unmatched", `unmatched, age filtered` = "unmatched_age_filtered", matched = "matched", `matched, age filtered` = "matched_age_filtered")
+  for (name in names(files)) {
+    write.table(sets[[name]], file.path(resources_lod, paste0("SHCS_Sardinia_", files[[name]], "_trajectories", suffix, ".txt")), sep = "\t", quote = F, row.names = F)
+  }
+}
+
+write_sets(sets)
+```
+
+
+# All genes
+
+The same sets are made for the trajectories of all genes and written with the suffix `_all_genes`. The 5-gene sets are the main analysis
+(Figure 4, Figures S11-S18).
+
+```{r}
+res_all <- build_sets(shcs_all, sardinia_all)
+
+set_table(res_all$sets)
+write_sets(res_all$sets, "_all_genes")
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```

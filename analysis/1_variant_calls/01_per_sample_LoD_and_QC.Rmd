@@ -1,0 +1,2635 @@
+---
+title: "Per-sample limit of detection, non-CHIP variants, sample QC and Figure S2"
+author: "Valeriia Timonina"
+date: "2026-10-13"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 5)
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+library(vcfR)
+library(ggpubr)
+library(patchwork)
+library(scales)
+
+theme_set(theme_classic())
+```
+
+This notebook follows the variants that Mutect2 calls
+outside the known CHIP positions ("non-CHIP variants") across the serial samples of each participant,
+compares them with the CHIP variants, and ends with the limit of detection (LoD) of these variants
+calculated with the `chip_lod` package.
+
+| Section | Step |
+|---|---|
+| 1 | Data: Mutect2 calls of all samples, sample dates |
+| 2 | **Defining CHIP and non-CHIP variants** |
+| 3 | bam-readcount pileup at the variant positions, one row per sample and variant |
+| 4 | **Splitting non-CHIP variants into potential germline and potential somatic** |
+| 5 | **Comparing Mutect2 with bam-readcount** |
+| 6 | **Exploring non-CHIP variants and comparing them with CHIP variants** |
+| 7 | **Limit of detection of non-CHIP variants (`chip_lod`)**, with a stringent set of somatic trajectories (7.6) |
+| 8 | **Theoretical LoD and the data**: figures and numbers for the paper (SHCS and SardiNIA) |
+| 9 | Differences from an earlier version of this notebook |
+
+Terms used throughout:
+
+- **call**: one Mutect2 record in one sample.
+- **variant**: `CHROM_POS_REF_ALT` (column `variant`).
+- **trajectory**: one variant in one individual across that individual's timepoints (column `traj_id`).
+
+The notebook writes three outputs, each only if its parameter is set to `TRUE`; everything else is only read:
+
+- the two region lists for bam-readcount (`write_region_files`, to new file names, see section 2.3);
+- the contamination check of every sample, `resources/SHCS_sample_contamination_QC.txt` (`write_sample_qc`,
+  section 3.3). `02_SHCS_CHIP_trajectories.Rmd` and `03_nonCHIP_variants_QC.Rmd` read it to
+  leave out the samples flagged as mixed;
+- the four panels of Figure S2 and their assembly, as png and svg, to `output/Supplementary_Figures/`
+  (`write_paper_figures`, section 8).
+
+
+# Parameters
+
+```{r parameters}
+chip_vaf <- 0.02             # CHIP VAF threshold, dashed line in the plots
+
+# potential germline vs potential somatic
+het_af_range <- c(0.3, 0.6)  # all calls of a trajectory inside this range: heterozygous germline
+hom_af_min   <- 0.9          # any call above: homozygous germline
+low_af_max   <- 0.2          # "low VAF" limit used for single calls and for the pileup median VAF
+
+mixed_sample_min   <- 0.01      # sample flagged as mixed above this share of foreign reads (section 3.3)
+pileup_ratio_range <- c(0.5, 2) # pileup / Mutect2 variant reads of a variant; outside: not followed in the pileup (5.1)
+max_individuals    <- 5         # a variant found in more individuals than this is recurrent (section 7.6)
+
+# One sample is in the pileup twice, under two suffixed names (section 3.1: the two
+# runs hold the same reads). resources/pileup_sample_names.txt lists the run to use and the run to drop
+# (tab-separated: pileup_name, action = use / drop, sample)
+pileup_names <- read.delim("resources/pileup_sample_names.txt", colClasses = "character")
+pileup_sample_alias <- with(subset(pileup_names, action == "use"), setNames(sample, pileup_name))
+pileup_sample_drop  <- subset(pileup_names, action == "drop")$pileup_name
+
+# the example individuals of sections 5.3 and 6.2, by their participant id in the paper
+paper_ids <- read.delim("resources/SHCS_change_ids.txt")
+id_of <- function(new_id) paper_ids$ID[paper_ids$SHCS_ID_new == new_id]
+
+# chip_lod (package defaults)
+err_rate  <- 0.001           # per-base sequencing error rate e
+alpha     <- 0.05            # per-site false-positive rate used for k*
+power_tgt <- 0.95            # detection probability that defines the LoD
+
+write_region_files <- TRUE  # TRUE writes the bam-readcount region lists of section 2.3
+write_sample_qc    <- TRUE  # TRUE writes the per-sample contamination table of section 3.3
+write_paper_figures <- TRUE # TRUE writes the figures of section 8 (png and svg) to paper_fig_dir
+
+paper_dir     <- "output"
+paper_fig_dir <- file.path(paper_dir, "Supplementary_Figures")
+
+chip_colors   <- c("non-CHIP" = "#F8766D", "CHIP" = "#00BFC4")
+class_colors  <- c("potential somatic" = "#D55E00", "potential germline" = "grey55")
+status_levels <- c("VAF >= LoD", "called, VAF < LoD", "not called (k < k*)")
+status_colors <- setNames(c("#2a78d6", "#E69F00", "#898781"), status_levels)
+
+med_iqr <- function(x, digits = 0, scale = 1) {
+  if (all(is.na(x))) return("-")
+  q <- quantile(x * scale, c(0.5, 0.25, 0.75), na.rm = TRUE)
+  sprintf("%.*f (%.*f-%.*f)", digits, q[1], digits, q[2], digits, q[3])
+}
+n_pct <- function(x) sprintf("%d (%.1f%%)", sum(x), 100 * mean(x))
+```
+
+
+# 1. Data
+
+## 1.1 Mutect2 calls
+
+One single-sample VCF per sequenced sample. From each record the sample fields `GT`, `AD` (reference and
+alternate read counts), `AF` and `DP` are kept.
+
+```{r read-mutect2}
+vcf_dir   <- "resources/mutect2_Calls/mutect2_output"
+vcf_files <- list.files(vcf_dir, pattern = "vcf.gz$")
+
+# One row per record of a single-sample Mutect2 VCF
+read_mutect2_vcf <- function(file) {
+  vcf <- read.vcfR(file.path(vcf_dir, file), verbose = FALSE)
+  stopifnot(ncol(vcf@gt) == 2)                       # FORMAT + one sample
+  fmt <- function(element) unname(extract.gt(vcf, element = element)[, 1])
+  ad  <- str_split_fixed(fmt("AD"), ",", 3)          # "ref,alt" (more alleles only at multiallelic sites)
+
+  as_tibble(vcf@fix[, c("CHROM", "POS", "REF", "ALT", "FILTER"), drop = FALSE]) %>%
+    mutate(Sample    = colnames(vcf@gt)[2],
+           POS       = as.integer(POS),
+           GT        = fmt("GT"),
+           ref_count = as.numeric(ad[, 1]),
+           alt_count = as.numeric(ad[, 2]),
+           AF        = as.numeric(str_split_fixed(fmt("AF"), ",", 2)[, 1]),
+           DP        = as.numeric(fmt("DP")))
+}
+
+mutect_all <- map_dfr(vcf_files, read_mutect2_vcf)
+```
+
+Records that Mutect2 flags as `germline` or `multiallelic` are removed, as are calls on chrY. Everything
+else is kept, so the table holds `PASS` calls and calls with other Mutect2 filter flags.
+
+```{r filter-mutect2}
+mutect_all %>%
+  mutate(record = case_when(
+    grepl("germline|multiallelic", FILTER) ~ "removed: FILTER contains germline or multiallelic",
+    CHROM == "chrY"                        ~ "removed: chrY",
+    FILTER == "PASS"                       ~ "kept: PASS",
+    TRUE                                   ~ "kept: other Mutect2 filter flags")) %>%
+  count(record, name = "records") %>%
+  knitr::kable()
+
+merged_vcf <- mutect_all %>%
+  filter(!grepl("germline|multiallelic", FILTER), CHROM != "chrY")
+
+# AD is "ref,alt" and adds up to DP in every kept record
+stopifnot(all(merged_vcf$ref_count + merged_vcf$alt_count == merged_vcf$DP))
+```
+
+Filter flags of the kept calls that are not `PASS` (a call can carry several):
+
+```{r filter-flags}
+merged_vcf %>%
+  filter(FILTER != "PASS") %>%
+  separate_rows(FILTER, sep = ";") %>%
+  count(flag = FILTER, name = "calls", sort = TRUE) %>%
+  knitr::kable()
+```
+
+Number of kept calls per sample:
+
+```{r calls-per-sample, fig.height=3.5}
+merged_vcf %>%
+  count(Sample) %>%
+  ggplot(aes(x = Sample, y = n)) +
+  geom_col() +
+  labs(x = paste0("Sample (", n_distinct(merged_vcf$Sample), ")"), y = "Mutect2 calls kept") +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+
+
+## 1.2 Samples
+
+Sample manifest with the collection date of each sample. Age at collection is the collection year minus
+the SHCS birth year. `has_vcf` marks the samples with a Mutect2 VCF.
+
+```{r samples}
+admin <- read.csv("resources/SHCS_database/2025-12/admin.csv") %>%
+  distinct(ID, BORN)
+stopifnot(!anyDuplicated(admin$ID))
+
+samples <- read.csv("resources/samples_with_dates.csv") %>%
+  transmute(Sample  = ID,
+            ID      = as.numeric(gsub("ID SHCS ", "", Subject.Id)),
+            LABDATE = as.Date(gsub(" 00:00:00", "", Collection), format = "%d/%m/%Y")) %>%
+  left_join(admin, by = "ID") %>%
+  mutate(Age     = as.integer(format(LABDATE, "%Y")) - BORN,
+         has_vcf = Sample %in% sub(".vcf.gz$", "", vcf_files)) %>%
+  select(-BORN)
+
+merged_vcf <- merged_vcf %>%
+  inner_join(samples, by = "Sample")
+stopifnot(n_distinct(merged_vcf$Sample) == length(vcf_files))
+
+# individuals with longitudinal sequencing (a Mutect2 VCF)
+long_ids <- sort(unique(merged_vcf$ID))
+
+samples %>%
+  filter(has_vcf) %>%
+  count(ID, name = "timepoints") %>%
+  count(timepoints, name = "individuals") %>%
+  knitr::kable(caption = "Timepoints with a Mutect2 VCF per individual")
+```
+
+
+# 2. Defining CHIP and non-CHIP variants
+
+## 2.1 CHIP positions
+
+The CHIP variants are the calls made at Vanderbilt (`CHIP_calls_all_long.csv`, ANNOVAR coordinates).
+
+```{r chip-list}
+chip_calls_long <- read.csv("resources/CHIP_calls_longitudinal/CHIP_calls_all_long.csv", fileEncoding = "UTF-8-BOM") %>%
+  distinct(Gene = Gene.refGene, Chr, Start, End, Ref, Alt, Func.refGene, ExonicFunc.refGene, AAChange.refGene)
+
+c(CHIP_variants = nrow(chip_calls_long), positions = nrow(distinct(chip_calls_long, Chr, Start)))
+```
+
+A VCF and ANNOVAR do not describe an indel with the same position and alleles, and bam-readcount follows
+the ANNOVAR convention:
+
+| | VCF (Mutect2) | ANNOVAR / bam-readcount |
+|---|---|---|
+| SNV | `POS`, `REF>ALT` | same position, allele `ALT` |
+| deletion | `chr17:60663171 TA>T` | `Start = 60663172`, `Ref = A`, `Alt = -`, allele `-A` |
+| insertion | `chr4:105272692 G>GA` | `Start = 105272692`, `Ref = -`, `Alt = A`, allele `+A` |
+
+`get_variant_locus()` converts a VCF variant to this convention.
+
+```{r variant-locus}
+# VCF (POS, REF, ALT) -> locus and alleles as used by ANNOVAR and bam-readcount.
+#   rc_pos, rc_end : first and last position of the locus (region for bam-readcount)
+#   rc_allele      : allele string in the bam-readcount output ("A", "+A", "-A")
+get_variant_locus <- function(pos, ref, alt) {
+  ref <- toupper(ref)
+  alt <- toupper(alt)
+
+  if (nchar(ref) == nchar(alt)) {
+    return(tibble(type = ifelse(nchar(ref) == 1, "SNV", "MNV"),
+                  rc_pos = pos, rc_end = pos + nchar(ref) - 1,
+                  annovar_ref = ref, annovar_alt = alt, rc_allele = alt))
+  }
+
+  # strip shared leading bases beyond the single VCF anchor base
+  while (nchar(ref) > 1 && nchar(alt) > 1 && substr(ref, 1, 1) == substr(alt, 1, 1)) {
+    ref <- substr(ref, 2, nchar(ref))
+    alt <- substr(alt, 2, nchar(alt))
+    pos <- pos + 1
+  }
+
+  if (nchar(alt) > nchar(ref)) {
+    # insertion: stays at the anchor position
+    inserted <- substr(alt, 2, nchar(alt))
+    tibble(type = "insertion", rc_pos = pos, rc_end = pos,
+           annovar_ref = "-", annovar_alt = inserted, rc_allele = paste0("+", inserted))
+  } else {
+    # deletion: starts one base after the anchor
+    deleted <- substr(ref, 2, nchar(ref))
+    tibble(type = "deletion", rc_pos = pos + 1, rc_end = pos + nchar(deleted),
+           annovar_ref = deleted, annovar_alt = "-", rc_allele = paste0("-", deleted))
+  }
+}
+```
+
+## 2.2 CHIP flag
+
+**Definition used in this notebook: a Mutect2 call is CHIP if its VCF position
+is within 1 bp of the start of a Vanderbilt CHIP call.** The 1 bp window absorbs the indel offset between
+the two conventions. The alleles are not compared, so the flag marks CHIP *positions*.
+
+`variant_defs` has one row per distinct variant that Mutect2 called in any sample.
+
+```{r chip-flag}
+chip_pos_key <- paste(chip_calls_long$Chr, chip_calls_long$Start)
+at_chip_pos  <- function(chrom, pos) paste(chrom, pos) %in% chip_pos_key
+chip_gene_at <- function(chrom, pos) chip_calls_long$Gene[match(paste(chrom, pos), chip_pos_key)]
+
+variant_defs <- merged_vcf %>%
+  distinct(CHROM, POS, REF, ALT) %>%
+  mutate(variant = paste(CHROM, POS, REF, ALT, sep = "_"),
+         locus   = pmap(list(POS, REF, ALT), get_variant_locus)) %>%
+  unnest(locus) %>%
+  mutate(CHIP = as.integer(at_chip_pos(CHROM, POS) | at_chip_pos(CHROM, POS + 1) | at_chip_pos(CHROM, POS - 1)),
+         Gene = coalesce(chip_gene_at(CHROM, POS), chip_gene_at(CHROM, POS + 1), chip_gene_at(CHROM, POS - 1)),
+         CHIP_lab = factor(ifelse(CHIP == 1, "CHIP", "non-CHIP"), levels = names(chip_colors))) %>%
+  # stricter check, for information: the exact Vanderbilt variant (position and alleles)
+  left_join(chip_calls_long %>% transmute(CHROM = Chr, rc_pos = Start, annovar_ref = Ref, annovar_alt = Alt, CHIP_exact = 1L),
+            by = c("CHROM", "rc_pos", "annovar_ref", "annovar_alt")) %>%
+  mutate(CHIP_exact = replace_na(CHIP_exact, 0L))
+
+# two VCF variants never map to the same bam-readcount allele
+stopifnot(!anyDuplicated(variant_defs[c("CHROM", "rc_pos", "rc_allele")]))
+
+merged_vcf <- merged_vcf %>%
+  left_join(variant_defs %>% select(CHROM, POS, REF, ALT, variant, type, CHIP, CHIP_lab, Gene),
+            by = c("CHROM", "POS", "REF", "ALT")) %>%
+  mutate(traj_id = paste(ID, variant, sep = "_"))
+
+merged_vcf %>%
+  group_by(CHIP_lab) %>%
+  summarise(calls = n(),
+            `PASS calls` = sum(FILTER == "PASS"),
+            variants = n_distinct(variant),
+            trajectories = n_distinct(traj_id),
+            individuals = n_distinct(ID)) %>%
+  knitr::kable()
+```
+
+Variant types:
+
+```{r variant-types}
+table(type = variant_defs$type, variant_defs$CHIP_lab)
+```
+
+The position rule and the exact Vanderbilt variant disagree for a few variants. They sit at a CHIP position
+but carry another allele, and are kept as CHIP here:
+
+```{r chip-position-vs-exact}
+table(CHIP_position_rule = variant_defs$CHIP, exact_Vanderbilt_variant = variant_defs$CHIP_exact)
+
+variant_defs %>%
+  filter(CHIP == 1, CHIP_exact == 0) %>%
+  left_join(merged_vcf %>%
+              group_by(variant) %>%
+              summarise(calls = n(), individuals = n_distinct(ID), median_AF = median(AF),
+                        FILTER = paste(unique(FILTER), collapse = " | ")),
+            by = "variant") %>%
+  select(variant, Gene, type, calls, individuals, median_AF, FILTER) %>%
+  knitr::kable()
+```
+
+Individuals without any CHIP call. They are left
+out of the per-individual trajectory plots below.
+
+```{r ids-no-chip}
+ids_no_chip <- setdiff(long_ids, merged_vcf$ID[merged_vcf$CHIP == 1])
+ids_no_chip
+```
+
+Non-CHIP variants are often shared between individuals. Number of individuals in which each non-CHIP
+variant is called:
+
+```{r nonchip-recurrence, fig.height=3.5}
+nonchip_recurrence <- merged_vcf %>%
+  filter(CHIP == 0) %>%
+  group_by(variant, type) %>%
+  summarise(N_IDs = n_distinct(ID), calls = n(), `PASS calls` = sum(FILTER == "PASS"), .groups = "drop") %>%
+  arrange(-N_IDs)
+
+head(nonchip_recurrence, 10) %>% knitr::kable()
+
+ggplot(nonchip_recurrence, aes(x = N_IDs, fill = type)) +
+  geom_histogram(binwidth = 1, boundary = 0.5) +
+  labs(x = paste0("Individuals with a call (of ", length(long_ids), ")"), y = "Non-CHIP variants", fill = NULL)
+```
+
+
+## 2.3 Region lists for bam-readcount
+
+bam-readcount was run at the positions of all CHIP and all non-CHIP variants. The lists on disk
+(`resources/chip_vars_for_bam_readcount.txt`, `resources/nonchip_vars_for_bam_readcount.txt`) were written by
+an earlier version of this notebook, which placed insertions one base after their anchor position. The pileup therefore
+does not contain most insertions (section 3.2).
+
+The lists below use the corrected insertion position. They are compared with the lists on disk and written
+only on request, under new names, so that the lists matching the existing pileup stay as they are.
+
+```{r region-lists}
+region_list <- function(variants) {
+  variants %>%
+    distinct(chrom = CHROM, start = rc_pos, end = rc_end) %>%
+    arrange(chrom, start)
+}
+
+chip_variants    <- region_list(variant_defs %>% filter(CHIP == 1))
+nonchip_variants <- region_list(variant_defs %>% filter(CHIP == 0))
+
+read_regions <- function(file) read.table(file, sep = "\t", col.names = c("chrom", "start", "end"))
+
+compare_regions <- function(new, file) {
+  disk <- read_regions(file)
+  tibble(file = basename(file),
+         `regions on disk` = nrow(disk),
+         `regions here` = nrow(new),
+         `in both` = nrow(inner_join(new, disk, by = c("chrom", "start", "end"))),
+         `only on disk` = nrow(anti_join(disk, new, by = c("chrom", "start", "end"))),
+         `only here` = nrow(anti_join(new, disk, by = c("chrom", "start", "end"))))
+}
+
+bind_rows(compare_regions(chip_variants, "resources/chip_vars_for_bam_readcount.txt"),
+          compare_regions(nonchip_variants, "resources/nonchip_vars_for_bam_readcount.txt")) %>%
+  knitr::kable()
+
+if (write_region_files) {
+  write.table(chip_variants, "resources/chip_vars_for_bam_readcount_corrected.txt",
+              sep = "\t", row.names = FALSE, quote = FALSE, col.names = FALSE)
+  write.table(nonchip_variants, "resources/nonchip_vars_for_bam_readcount_corrected.txt",
+              sep = "\t", row.names = FALSE, quote = FALSE, col.names = FALSE)
+}
+```
+
+The regions that differ are the insertions (`r sum(variant_defs$type == "insertion")` variants).
+
+
+# 3. bam-readcount pileup at the variant positions
+
+## 3.1 Pileup files
+
+One row per sample and position, with the alleles seen at that position packed into `var1..varN` as
+`allele:count:avg_mapq:avg_baseq`. Regions of neighbouring variants overlap, which lists some positions
+more than once per sample; these rows are exact duplicates and are removed.
+
+```{r read-pileup}
+read_pileup <- function(file) {
+  read.table(file, sep = "\t", header = TRUE, stringsAsFactors = FALSE, colClasses = c(ref = "character")) %>%
+    distinct()
+}
+
+readcount_chip    <- read_pileup("resources/All.chip.bam_readcount.txt")
+readcount_nonchip <- read_pileup("resources/All.nonchip.bam_readcount.txt")
+```
+
+All sample names of the pileup are in the manifest except two: one sample was piled up twice,
+under two suffixed names. The two runs hold the same reads, not two independent measurements: their depths
+differ by a few reads per position, far less than two sequencing runs of this depth would (first table).
+Adding them up would count every read twice, so one run is used, under the sample name of the manifest. It
+is the run whose depth is marginally closer to the Mutect2 records of this sample (second table).
+
+```{r pileup-sample-duplicate}
+setdiff(unique(c(readcount_chip$S_ID, readcount_nonchip$S_ID)), samples$Sample)
+
+# the two runs side by side
+bind_rows(readcount_chip, readcount_nonchip) %>%
+  filter(S_ID %in% c(names(pileup_sample_alias), pileup_sample_drop)) %>%
+  distinct(S_ID, chr, pos, depth) %>%
+  mutate(run = ifelse(S_ID %in% pileup_sample_drop, "dropped", "used")) %>%
+  select(-S_ID) %>%
+  pivot_wider(names_from = run, values_from = depth) %>%
+  summarise(positions = n(),
+            `depth of the run used, median` = median(used),
+            `depth of the run dropped, median` = median(dropped),
+            `difference in depth (used - dropped), median` = median(used - dropped),
+            `25th to 75th percentile` = paste(quantile(used - dropped, c(0.25, 0.75)), collapse = " to "),
+            `positions differing by > 5%` = sum(abs(used - dropped) / used > 0.05),
+            `sd of the difference expected for two independent runs` = round(sqrt(2 * median(used)))) %>%
+  knitr::kable()
+
+# each run against all Mutect2 SNV records of the sample (before any filter)
+mutect_all %>%
+  filter(Sample %in% pileup_sample_alias, nchar(REF) == 1, nchar(ALT) == 1) %>%
+  inner_join(bind_rows(readcount_chip, readcount_nonchip) %>%
+               filter(S_ID %in% c(names(pileup_sample_alias), pileup_sample_drop)) %>%
+               distinct(S_ID, chr, pos, depth),
+             by = c("CHROM" = "chr", "POS" = "pos"), relationship = "many-to-many") %>%
+  group_by(run = ifelse(S_ID %in% pileup_sample_drop, "dropped", "used"), S_ID) %>%
+  summarise(`Mutect2 SNV records` = n(),
+            `Mutect2 DP / pileup depth, median` = round(median(DP / depth), 4),
+            `|Mutect2 DP - pileup depth|, mean` = round(mean(abs(DP - depth)), 1),
+            .groups = "drop") %>%
+  knitr::kable()
+
+use_one_run <- function(df) {
+  df %>%
+    filter(!S_ID %in% pileup_sample_drop) %>%
+    mutate(S_ID = coalesce(unname(pileup_sample_alias[S_ID]), S_ID))
+}
+readcount_chip    <- use_one_run(readcount_chip)
+readcount_nonchip <- use_one_run(readcount_nonchip)
+
+stopifnot(all(readcount_chip$S_ID %in% samples$Sample), all(readcount_nonchip$S_ID %in% samples$Sample),
+          !anyDuplicated(readcount_chip[c("S_ID", "chr", "pos")]),
+          !anyDuplicated(readcount_nonchip[c("S_ID", "chr", "pos")]))
+```
+
+```{r pileup-long}
+
+# one row per sample and position (both files), and one row per allele seen there
+pileup_sites <- bind_rows(readcount_chip, readcount_nonchip) %>%
+  distinct(S_ID, chr, pos, ref, depth)
+stopifnot(!anyDuplicated(pileup_sites[c("S_ID", "chr", "pos")]))
+
+parse_readcount_long <- function(df) {
+  df %>%
+    select(S_ID, chr, pos, starts_with("var")) %>%
+    pivot_longer(starts_with("var"), names_to = NULL, values_to = "allele_str", values_drop_na = TRUE) %>%
+    separate(allele_str, into = c("allele", "count"), sep = ":", extra = "drop") %>%
+    mutate(count = as.integer(count))
+}
+
+pileup_alleles <- bind_rows(parse_readcount_long(readcount_chip), parse_readcount_long(readcount_nonchip)) %>%
+  distinct()
+stopifnot(!anyDuplicated(pileup_alleles[c("S_ID", "chr", "pos", "allele")]))
+```
+
+The pileup covers more samples than the Mutect2 calls: all timepoints of the longitudinal individuals and
+one sample of each individual of the cross-sectional run.
+
+```{r pileup-samples}
+pileup_samples <- tibble(S_ID = unique(pileup_sites$S_ID)) %>%
+  left_join(samples, by = c("S_ID" = "Sample"))
+
+pileup_samples %>%
+  mutate(group = ifelse(ID %in% long_ids, "longitudinal individual", "individual with a single sample (no VCF here)")) %>%
+  group_by(group) %>%
+  summarise(samples = n(), `with Mutect2 VCF` = sum(has_vcf), individuals = n_distinct(ID)) %>%
+  knitr::kable()
+
+# every sample with a Mutect2 VCF has a pileup
+stopifnot(all(samples$Sample[samples$has_vcf] %in% pileup_samples$S_ID))
+```
+
+
+## 3.2 One row per sample and variant
+
+bam-readcount only reports pileups, it does not know which allele is "the" variant. `readcount_all` crosses
+every pileup sample with every variant in `variant_defs` whose locus was queried, and picks the count of
+that variant's allele (0 if the allele was not seen). `Detected` marks the samples in which Mutect2 called
+the variant.
+
+```{r variant-table}
+mutect_calls <- merged_vcf %>%
+  distinct(Sample, variant) %>%
+  mutate(Detected = 1)
+
+readcount_all <- pileup_sites %>%
+  inner_join(samples, by = c("S_ID" = "Sample")) %>%
+  inner_join(variant_defs %>% filter(type != "MNV"),
+             by = c("chr" = "CHROM", "pos" = "rc_pos"), relationship = "many-to-many") %>%
+  left_join(pileup_alleles %>% rename(ref_count = count), by = c("S_ID", "chr", "pos", "ref" = "allele")) %>%
+  left_join(pileup_alleles %>% rename(alt_count = count), by = c("S_ID", "chr", "pos", "rc_allele" = "allele")) %>%
+  left_join(mutect_calls, by = c("S_ID" = "Sample", "variant")) %>%
+  mutate(ref_count    = replace_na(ref_count, 0L),
+         alt_count    = replace_na(alt_count, 0L),
+         Detected     = replace_na(Detected, 0),
+         VAF          = alt_count / depth,
+         longitudinal = ID %in% long_ids,
+         traj_id      = paste(ID, variant, sep = "_")) %>%
+  # `alt` is the bam-readcount allele ("C", "-T", "+AT"), not the VCF ALT
+  select(ID, S_ID, LABDATE, Age, has_vcf, longitudinal, chr, pos, ref, alt = rc_allele, variant, traj_id,
+         type, CHIP, CHIP_lab, Gene, depth, ref_count, alt_count, VAF, Detected)
+
+stopifnot(!anyDuplicated(readcount_all[c("S_ID", "variant")]))
+```
+
+Variants that can be followed in the pileup. Multi-nucleotide variants have no single pileup allele, and
+most insertions were not queried at their own position (section 2.3):
+
+```{r pileup-coverage}
+variant_defs %>%
+  mutate(`locus in pileup` = variant %in% readcount_all$variant,
+         `allele seen in >= 1 sample` = variant %in% readcount_all$variant[readcount_all$alt_count > 0]) %>%
+  group_by(CHIP_lab, type) %>%
+  summarise(variants = n(), `locus in pileup` = sum(`locus in pileup`),
+            `allele seen in >= 1 sample` = sum(`allele seen in >= 1 sample`), .groups = "drop") %>%
+  knitr::kable()
+```
+
+Two tables hold the rows with at least one read of the variant allele:
+
+```{r long-tables}
+readcount_chip_long    <- readcount_all %>% filter(CHIP == 1, alt_count > 0)
+readcount_nonchip_long <- readcount_all %>% filter(CHIP == 0, alt_count > 0)
+
+c(readcount_chip_long = nrow(readcount_chip_long), readcount_nonchip_long = nrow(readcount_nonchip_long))
+```
+
+
+## 3.3 Samples with foreign DNA
+
+At a site where an individual is homozygous for the variant allele, every read should carry it. The share
+of reads that do not is a simple measure of DNA from another person in a sample. Homozygous sites are the
+non-CHIP SNVs with a median pileup VAF above 0.95 over the timepoints of the individual.
+
+```{r sample-qc, fig.height=4}
+sample_qc <- readcount_all %>%
+  filter(CHIP == 0, longitudinal, type == "SNV", depth > 0) %>%
+  group_by(traj_id) %>%
+  filter(median(VAF) > 0.95) %>%
+  group_by(ID, S_ID, LABDATE) %>%
+  summarise(hom_sites = n(), foreign_read_share = mean(1 - VAF), .groups = "drop") %>%
+  left_join(merged_vcf %>% count(Sample, name = "mutect_calls"), by = c("S_ID" = "Sample")) %>%
+  left_join(merged_vcf %>% filter(grepl("contamination", FILTER)) %>% count(Sample, name = "calls_flagged_contamination"),
+            by = c("S_ID" = "Sample")) %>%
+  mutate(mixed = foreign_read_share > mixed_sample_min) %>%
+  arrange(-foreign_read_share)
+
+mixed_samples <- sample_qc$S_ID[sample_qc$mixed]
+
+ggplot(sample_qc, aes(x = rank(-foreign_read_share), y = foreign_read_share, colour = mixed)) +
+  geom_hline(yintercept = mixed_sample_min, linetype = "dashed") +
+  geom_point(size = 1) +
+  geom_text(data = sample_qc %>% filter(mixed), aes(label = paste0(S_ID, " (ID ", ID, ")")), hjust = -0.08, size = 3) +
+  scale_y_log10(labels = percent) +
+  scale_colour_manual(values = c("FALSE" = "grey40", "TRUE" = "red3"), guide = "none") +
+  labs(x = "Samples of longitudinal individuals, ranked", y = "Reads without the individual's\nhomozygous allele (mean over sites)")
+
+head(sample_qc, 6) %>%
+  mutate(foreign_read_share = percent(foreign_read_share, accuracy = 0.01)) %>%
+  knitr::kable()
+
+# all samples, with the flag and the threshold it was set with
+if (write_sample_qc) {
+  write.table(sample_qc %>% mutate(mixed_sample_min = mixed_sample_min),
+              "resources/SHCS_sample_contamination_QC.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+}
+```
+
+`r length(mixed_samples)` samples are above `r percent(mixed_sample_min)` (dashed line), against a median of
+`r percent(median(sample_qc$foreign_read_share), accuracy = 0.01)`. Foreign DNA adds the other person's germline
+variants as low-VAF calls at a single timepoint, which is what non-CHIP variants look like. All samples are
+kept in sections 4.1 to 6. The flagged samples are left out of the
+final classification (section 4.2) and of the limit of detection (section 7).
+
+
+# 4. Splitting non-CHIP variants into potential germline and potential somatic
+
+Mutect2's own `germline` flag has already removed most germline variants (section 1.1). What is left is
+split per trajectory.
+
+## 4.1 Rule on the Mutect2 AF
+
+A non-CHIP trajectory is **potential germline** if all of its calls have an AF between
+`r het_af_range[1]` and `r het_af_range[2]` (heterozygous), or if any call has an AF above `r hom_af_min`
+(homozygous). All other trajectories are **potential somatic**. This rule uses all samples and is the one
+behind the plots of sections 5 and 6.
+
+```{r split-mutect}
+# class of each trajectory from the AF of its Mutect2 calls
+mutect_rule <- function(calls) {
+  calls %>%
+    group_by(ID, variant, traj_id) %>%
+    summarise(n_calls  = n(),
+              min_AF   = min(AF),
+              max_AF   = max(AF),
+              het_like = all(AF > het_af_range[1] & AF < het_af_range[2]),
+              hom_like = any(AF > hom_af_min),
+              .groups = "drop") %>%
+    mutate(class_mutect = ifelse(het_like | hom_like, "potential germline", "potential somatic"))
+}
+
+nonchip_class_mutect <- mutect_rule(merged_vcf %>% filter(CHIP == 0))
+
+merged_vcf <- merged_vcf %>%
+  left_join(nonchip_class_mutect %>% select(traj_id, class_mutect), by = "traj_id")
+
+nonchip_class_mutect %>%
+  group_by(class_mutect) %>%
+  summarise(trajectories = n(),
+            `with > 1 call` = sum(n_calls > 1),
+            calls = sum(n_calls),
+            `homozygous-like` = sum(hom_like),
+            `heterozygous-like` = sum(het_like & !hom_like)) %>%
+  knitr::kable()
+```
+
+```{r split-mutect-plot, fig.height=3.5}
+merged_vcf %>%
+  filter(CHIP == 0) %>%
+  ggplot(aes(x = AF, fill = class_mutect)) +
+  geom_histogram(binwidth = 0.01, boundary = 0) +
+  geom_vline(xintercept = c(het_af_range, hom_af_min), linetype = "dotted") +
+  geom_vline(xintercept = low_af_max, linetype = "dashed") +
+  scale_y_continuous(trans = pseudo_log_trans(base = 10), breaks = c(0, 10, 100, 1000)) +
+  scale_fill_manual(values = class_colors) +
+  labs(x = "Mutect2 AF of non-CHIP calls", y = "Calls", fill = NULL)
+```
+
+Dotted lines: thresholds of the rule. Dashed line: AF `r low_af_max`, the limit
+applied to single calls in two plots (section 6.1); no call below it belongs to a potential germline
+trajectory.
+
+
+## 4.2 Check against the pileup and final class
+
+The rule above sees a variant only in the samples where Mutect2 kept it. A germline variant that Mutect2
+flags as `germline` at all timepoints but one stays in the table with a single call, and a homozygous
+variant in a mixed sample is called well below an AF of `r hom_af_min`. The pileup has the VAF at every
+timepoint, so a germline variant shows as a median VAF near 0.5 or 1.
+
+**Final class, used in section 7:** a non-CHIP trajectory is *potential germline* if the rule of 4.1 says so
+or if its median pileup VAF over the timepoints of the individual is at least `r low_af_max`; otherwise it
+is *potential somatic*. Samples with foreign DNA (section 3.3) are left out of both parts. Trajectories that
+Mutect2 never called in the individual are classified by the pileup alone.
+
+```{r split-final}
+traj_class <- full_join(
+  mutect_rule(merged_vcf %>% filter(CHIP == 0, !Sample %in% mixed_samples)),
+  readcount_all %>%
+    filter(CHIP == 0, longitudinal, !S_ID %in% mixed_samples, depth > 0) %>%
+    group_by(ID, variant, traj_id) %>%
+    summarise(pileup_timepoints = n(), pileup_median_VAF = median(VAF), .groups = "drop"),
+  by = c("ID", "variant", "traj_id")) %>%
+  mutate(mutect_called   = !is.na(class_mutect),
+         germline_pileup = pileup_median_VAF >= low_af_max,
+         class = ifelse(coalesce(class_mutect == "potential germline", FALSE) | coalesce(germline_pileup, FALSE),
+                        "potential germline", "potential somatic"))
+
+traj_class %>%
+  filter(mutect_called) %>%
+  mutate(pileup = case_when(is.na(germline_pileup) ~ "not in pileup",
+                            germline_pileup        ~ paste("median pileup VAF >=", low_af_max),
+                            TRUE                   ~ paste("median pileup VAF <", low_af_max))) %>%
+  count(`rule of 4.1` = class_mutect, pileup) %>%
+  pivot_wider(names_from = pileup, values_from = n, values_fill = 0) %>%
+  knitr::kable(caption = "Trajectories with a Mutect2 call, samples with foreign DNA left out")
+```
+
+The trajectories that are potential germline by the rule of 4.1 but have a low pileup VAF belong to indels
+that the pileup does not capture (section 5.1); they keep the class of 4.1.
+
+```{r split-final-plot, fig.height=3.5}
+traj_class %>%
+  filter(mutect_called, !is.na(pileup_median_VAF)) %>%
+  ggplot(aes(x = pileup_median_VAF, fill = class_mutect)) +
+  geom_histogram(binwidth = 0.02, boundary = 0) +
+  geom_vline(xintercept = low_af_max, linetype = "dashed") +
+  scale_y_continuous(trans = pseudo_log_trans(base = 10), breaks = c(0, 10, 100, 1000)) +
+  scale_fill_manual(values = class_colors) +
+  labs(x = "Median pileup VAF of the trajectory", y = "Trajectories with a Mutect2 call", fill = "Rule of 4.1")
+```
+
+```{r split-final-table}
+traj_class %>%
+  count(`Mutect2 call in the individual` = ifelse(mutect_called, "yes", "no"), class) %>%
+  pivot_wider(names_from = class, values_from = n, values_fill = 0) %>%
+  knitr::kable(caption = "Final class of all non-CHIP trajectories")
+```
+
+
+# 5. Comparing Mutect2 with bam-readcount
+
+## 5.1 Agreement of VAF and depth
+
+Calls that are present in both tables, matched on sample and exact variant.
+
+```{r mutect-vs-pileup}
+mutect_vs_pileup <- merged_vcf %>%
+  inner_join(readcount_all %>% select(S_ID, variant, depth, pileup_alt = alt_count, VAF_readcount = VAF),
+             by = c("Sample" = "S_ID", "variant"))
+
+mutect_vs_pileup %>%
+  group_by(CHIP_lab) %>%
+  summarise(`Mutect2 calls` = n(),
+            `allele seen in pileup` = n_pct(pileup_alt > 0),
+            `Spearman rho, AF vs pileup VAF` = round(cor(AF, VAF_readcount, method = "spearman"), 3),
+            `|AF - pileup VAF| > 0.02` = sum(abs(AF - VAF_readcount) > 0.02),
+            `Mutect2 DP / pileup depth, median` = round(median(DP / depth), 3)) %>%
+  knitr::kable()
+```
+
+```{r mutect-vs-pileup-plot, fig.width=11, fig.height=5}
+p_chip <- mutect_vs_pileup %>%
+  filter(CHIP == 1) %>%
+  ggplot(aes(x = AF, y = VAF_readcount, group = traj_id)) +
+  geom_abline(linetype = "dashed", colour = "grey60") +
+  geom_point() +
+  geom_line() +
+  labs(x = "Mutect2 AF", y = "bam-readcount VAF", title = "CHIP")
+
+p_nonchip <- mutect_vs_pileup %>%
+  filter(CHIP == 0) %>%
+  ggplot(aes(x = AF, y = VAF_readcount, colour = type)) +
+  geom_abline(linetype = "dashed", colour = "grey60") +
+  geom_point(size = 0.8, alpha = 0.6) +
+  labs(x = "Mutect2 AF", y = "bam-readcount VAF", colour = NULL, title = "non-CHIP")
+
+ggarrange(p_chip, p_nonchip, ncol = 2, widths = c(1, 1.2))
+
+cor.test(~ AF + VAF_readcount, data = mutect_vs_pileup %>% filter(CHIP == 1), method = "spearman", exact = FALSE)
+```
+
+CHIP calls where the two differ by more than 0.02:
+
+```{r mutect-vs-pileup-discordant}
+mutect_vs_pileup %>%
+  filter(CHIP == 1, abs(AF - VAF_readcount) > 0.02) %>%
+  select(ID, Sample, variant, Gene, FILTER, AF, DP, alt_count, depth, pileup_alt, VAF_readcount) %>%
+  knitr::kable()
+```
+
+For the CHIP variants the two agree. Among the non-CHIP variants there are deletions with a Mutect2 AF of
+0.1 to 0.5 and almost no reads in the pileup, and SNVs with more reads in the pileup than in Mutect2.
+Mutect2 counts reads after local reassembly, the pileup counts the alleles as they are aligned, so the two
+can describe the same event differently, mostly where several variants lie close together (last table of
+this section).
+
+Agreement per variant: variant reads in the pileup divided by Mutect2's alternate reads, summed over the
+samples where Mutect2 called the variant. Variants with a ratio outside `r pileup_ratio_range[1]` to
+`r pileup_ratio_range[2]` (dashed lines) are not followed in the pileup in section 7.
+
+```{r pileup-concordance, fig.height=3.5}
+pileup_concordance <- mutect_vs_pileup %>%
+  group_by(CHIP_lab, variant, type) %>%
+  summarise(calls = n(),
+            individuals = n_distinct(ID),
+            mutect_alt_reads = sum(alt_count),
+            pileup_alt_reads = sum(pileup_alt),
+            .groups = "drop") %>%
+  mutate(read_ratio = pileup_alt_reads / mutect_alt_reads,
+         pileup_ok  = read_ratio >= pileup_ratio_range[1] & read_ratio <= pileup_ratio_range[2])
+
+pileup_ok_variants <- pileup_concordance$variant[pileup_concordance$pileup_ok]
+
+# ratios below 0.02 (including 0) are drawn at 0.02
+ggplot(pileup_concordance, aes(x = pmax(read_ratio, 0.02), fill = type)) +
+  geom_histogram(bins = 45) +
+  geom_vline(xintercept = pileup_ratio_range, linetype = "dashed") +
+  scale_x_log10(breaks = c(0.02, 0.1, 0.5, 1, 2, 10), labels = c("<= 0.02", "0.1", "0.5", "1", "2", "10")) +
+  facet_wrap(~CHIP_lab, scales = "free_y") +
+  labs(x = "Variant reads in the pileup / in Mutect2", y = "Variants", fill = NULL)
+
+pileup_concordance %>%
+  group_by(CHIP_lab, type) %>%
+  summarise(variants = n(),
+            `ratio, median (IQR)` = med_iqr(read_ratio, 2),
+            `ratio in range` = sum(pileup_ok),
+            `ratio out of range` = sum(!pileup_ok),
+            `calls of the variants out of range` = sum(calls[!pileup_ok]),
+            .groups = "drop") %>%
+  knitr::kable()
+
+# Mutect2 flags for variants in a cluster of variants, by agreement with the pileup
+pileup_concordance %>%
+  filter(CHIP_lab == "non-CHIP") %>%
+  left_join(merged_vcf %>%
+              group_by(variant) %>%
+              summarise(cluster_flag = any(grepl("clustered_events|haplotype", FILTER))),
+            by = "variant") %>%
+  group_by(`read ratio` = ifelse(pileup_ok, "in range", "out of range")) %>%
+  summarise(`non-CHIP variants` = n(),
+            `with a clustered_events or haplotype flag` = n_pct(cluster_flag)) %>%
+  knitr::kable()
+```
+
+
+## 5.2 Read support of detected and not detected variants
+
+Every variant was queried in all samples, not only where Mutect2 called it. Comparing the reads of the
+variant allele between samples with (`Detected = 1`) and without a Mutect2 call shows what separates a call
+from the background. Only samples with a Mutect2 VCF are used, and samples without a read of the allele are
+included (count 0).
+
+```{r detected-vs-not}
+readcount_variants <- readcount_all %>%
+  filter(has_vcf, depth > 0) %>%
+  mutate(CHIP_lab2    = factor(ifelse(CHIP == 1, "CHIP positions", "Non-CHIP positions"),
+                               levels = c("CHIP positions", "Non-CHIP positions")),
+         Detected_lab = factor(ifelse(Detected == 1, "Detected", "Not detected"),
+                               levels = c("Not detected", "Detected")))
+
+summary_tbl <- readcount_variants %>%
+  group_by(CHIP, Detected) %>%
+  summarise(n = n(),
+            n_with_alt_reads = sum(alt_count > 0),
+            mean_depth = mean(depth),
+            mean_alt_count = mean(alt_count), median_alt_count = median(alt_count),
+            q25_alt_count = quantile(alt_count, .25), q75_alt_count = quantile(alt_count, .75),
+            mean_VAF = mean(VAF), median_VAF = median(VAF),
+            .groups = "drop")
+knitr::kable(summary_tbl, digits = 4)
+```
+
+```{r detected-vs-not-tests}
+# CHIP positions, detected vs not detected (alt_count)
+wilcox.test(alt_count ~ Detected, data = readcount_variants %>% filter(CHIP == 1))
+t.test(alt_count ~ Detected, data = readcount_variants %>% filter(CHIP == 1))
+
+# Non-CHIP positions, detected vs not detected (alt_count)
+wilcox.test(alt_count ~ Detected, data = readcount_variants %>% filter(CHIP == 0))
+t.test(alt_count ~ Detected, data = readcount_variants %>% filter(CHIP == 0))
+```
+
+```{r detected-vs-not-plots, fig.width=9, fig.height=4.5}
+col_detected    <- "#2a78d6"
+col_notdetected <- "#898781"
+
+ggplot(readcount_variants, aes(x = Detected_lab, y = alt_count + 1, fill = Detected_lab)) +
+  geom_boxplot(outlier.alpha = 0.15, width = 0.55, linewidth = 0.4) +
+  scale_y_log10() +
+  scale_fill_manual(values = c("Not detected" = col_notdetected, "Detected" = col_detected), guide = "none") +
+  facet_wrap(~CHIP_lab2) +
+  labs(x = NULL, y = "Alt allele read count (+1, log10 scale)",
+       title = "Read support for CHIP vs non-CHIP variants, by Mutect2 detection status") +
+  theme_classic(base_size = 12) +
+  theme(strip.background = element_rect(fill = "#f0efec", color = NA),
+        panel.grid.major.y = element_line(color = "#e1e0d9", linewidth = 0.3))
+
+ggplot(readcount_variants, aes(x = Detected_lab, y = VAF, fill = Detected_lab)) +
+  geom_boxplot(outlier.alpha = 0.15, width = 0.55, linewidth = 0.4) +
+  scale_y_continuous(labels = scales::percent) +
+  coord_cartesian(ylim = c(0, 0.6)) +
+  scale_fill_manual(values = c("Not detected" = col_notdetected, "Detected" = col_detected), guide = "none") +
+  facet_wrap(~CHIP_lab2) +
+  labs(x = NULL, y = "Variant allele fraction (alt_count / depth)",
+       title = "VAF for CHIP vs non-CHIP variants, by Mutect2 detection status") +
+  theme_classic(base_size = 12) +
+  theme(strip.background = element_rect(fill = "#f0efec", color = NA),
+        panel.grid.major.y = element_line(color = "#e1e0d9", linewidth = 0.3))
+```
+
+The high-VAF tail among the non-CHIP "not detected" observations is germline: variants that Mutect2 flagged
+as `germline` or `multiallelic` in that sample, which removed them from `merged_vcf` (section 1.1) although
+the reads are there.
+
+```{r not-detected-high-vaf}
+readcount_variants %>%
+  filter(CHIP == 0, Detected == 0) %>%
+  count(`pileup VAF` = cut(VAF, c(0, 1e-9, 0.02, low_af_max, 1), include.lowest = TRUE,
+                           labels = c("0", "> 0 to 0.02", paste("0.02 to", low_af_max), paste(">", low_af_max))),
+        name = "not detected observations") %>%
+  knitr::kable()
+```
+
+
+## 5.3 CHIP variants in the pileup, by detection status
+
+The pileup follows a CHIP clone at the timepoints where Mutect2 did not call it. Example individual SHCS_3:
+all CHIP alleles with at least one read (including alleles of other individuals' clones, which stay near
+zero), then only the variants that Mutect2 called at least once in this individual, then the read count
+against depth. Point shape: Mutect2 call in that sample.
+
+```{r chip-pileup-example, fig.width=8, fig.height=4.5}
+detected_shape <- scale_shape_manual(values = c("0" = 16, "1" = 17), labels = c("0" = "no", "1" = "yes"),
+                                     name = "Mutect2 call", na.translate = FALSE)
+
+chip_example <- readcount_chip_long %>% filter(ID == id_of("SHCS_3"))
+
+ggplot(chip_example, aes(x = Age, y = VAF, group = traj_id, shape = as.factor(Detected))) +
+  geom_point() +
+  geom_smooth(se = FALSE, show.legend = FALSE) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+  detected_shape
+
+chip_example %>%
+  group_by(traj_id) %>%
+  filter(sum(Detected) > 0) %>%
+  ggplot(aes(x = Age, y = VAF, group = traj_id, shape = as.factor(Detected))) +
+  geom_point() +
+  geom_smooth(se = FALSE, show.legend = FALSE) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+  detected_shape
+
+ggplot(chip_example, aes(x = depth, y = alt_count, group = traj_id, shape = as.factor(Detected))) +
+  geom_point() +
+  geom_line() +
+  detected_shape
+```
+
+The same for all longitudinal individuals:
+
+```{r chip-pileup-all, fig.width=14, fig.height=11}
+chip_long_ids <- readcount_chip_long %>% filter(longitudinal)
+
+ggplot(chip_long_ids, aes(x = Age, y = VAF, group = traj_id, shape = as.factor(Detected))) +
+  geom_point() +
+  geom_smooth(se = FALSE, show.legend = FALSE) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+  detected_shape +
+  facet_wrap(~ID)
+
+chip_long_ids %>%
+  group_by(traj_id) %>%
+  filter(sum(Detected) > 0) %>%
+  ggplot(aes(x = Age, y = VAF, group = traj_id, shape = as.factor(Detected))) +
+  geom_point() +
+  geom_smooth(se = FALSE, show.legend = FALSE) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+  detected_shape +
+  facet_wrap(~ID)
+
+ggplot(chip_long_ids, aes(x = depth, y = alt_count, group = traj_id, shape = as.factor(Detected))) +
+  geom_point() +
+  geom_line() +
+  detected_shape +
+  facet_wrap(~ID)
+```
+
+```{r chip-pileup-depth, fig.width=9, fig.height=4.5}
+p_all <- ggplot(chip_long_ids, aes(x = depth, y = alt_count, group = traj_id, shape = as.factor(Detected))) +
+  geom_point() +
+  geom_line() +
+  detected_shape
+
+p_depth <- ggplot(chip_long_ids, aes(y = depth, x = as.factor(Detected))) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("0" = "no", "1" = "yes")) +
+  labs(x = "Mutect2 call")
+
+ggarrange(p_all, p_depth, ncol = 2, widths = c(1.6, 1), common.legend = TRUE, legend = "right")
+```
+
+
+# 6. Exploring non-CHIP variants and comparing them with CHIP variants
+
+## 6.1 Mutect2 calls
+
+### Trajectories per individual
+
+Trajectories with more than one call. Non-CHIP trajectories are the potential somatic ones (rule of 4.1).
+Dashed line: VAF `r chip_vaf`.
+
+```{r mutect-trajectories, fig.width=14, fig.height=12}
+# trajectories with more than one Mutect2 call, in individuals with CHIP
+multi_call <- merged_vcf %>%
+  group_by(traj_id) %>%
+  filter(n() > 1) %>%
+  ungroup() %>%
+  filter(!ID %in% ids_no_chip)
+
+chip_multi    <- multi_call %>% filter(CHIP == 1)
+nonchip_multi <- multi_call %>% filter(CHIP == 0, class_mutect == "potential somatic")
+
+c(CHIP_trajectories = n_distinct(chip_multi$traj_id), non_CHIP_trajectories = n_distinct(nonchip_multi$traj_id))
+
+bind_rows(chip_multi, nonchip_multi) %>%
+  ggplot(aes(x = LABDATE, y = AF, group = traj_id, colour = CHIP_lab)) +
+  geom_line(linewidth = 0.6) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+  scale_colour_manual(values = chip_colors) +
+  labs(colour = NULL) +
+  facet_wrap(~ID, scales = "free")
+```
+
+### AF of non-CHIP calls
+
+All non-CHIP calls with an AF below `r low_af_max`, over time and as a distribution.
+
+```{r nonchip-af, fig.height=4.5}
+nonchip_low <- merged_vcf %>%
+  filter(CHIP == 0, AF < low_af_max)
+
+ggplot(nonchip_low, aes(x = LABDATE, y = AF, group = traj_id)) +
+  geom_line(linewidth = 0.6, color = "grey") +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed")
+
+ggplot(nonchip_low, aes(y = AF)) +
+  geom_boxplot() +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+  coord_cartesian(ylim = c(0, 0.05))
+
+summary(nonchip_low$AF)
+```
+
+Per individual:
+
+```{r nonchip-af-per-id, fig.width=14, fig.height=11}
+ggplot(nonchip_low, aes(y = AF)) +
+  geom_boxplot() +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+  facet_wrap(~ID, scales = "free")
+
+nonchip_low %>%
+  group_by(ID) %>%
+  summarise(calls = n(), min_AF = min(AF), lowQ_AF = quantile(AF, 0.25), median_AF = median(AF),
+            highQ_AF = quantile(AF, 0.75), max_AF = max(AF))
+```
+
+### AF against depth
+
+A clone has the same expected AF at any depth. An AF that falls as depth rises is expected for calls at the
+detection limit (the lowest AF that can be called falls with depth) and for artefacts whose number of reads
+does not scale with depth. Lines join the calls of one trajectory; blue: fit over all calls.
+
+Non-CHIP (potential somatic trajectories with more than one call):
+
+```{r af-vs-depth-nonchip, fig.height=4.5}
+ggplot(nonchip_multi, aes(x = DP, y = AF, group = traj_id)) +
+  geom_line() +
+  geom_smooth(group = 1)
+
+ggplot(nonchip_multi, aes(x = DP, y = AF, group = traj_id)) +
+  geom_line() +
+  geom_smooth(group = 1, method = "lm") +
+  scale_y_log10()
+
+ggplot(nonchip_multi, aes(x = DP, y = AF, group = traj_id)) +
+  geom_smooth(colour = "grey", se = FALSE, method = "lm", linewidth = 0.4) +
+  geom_smooth(group = 1, method = "lm") +
+  scale_y_log10()
+```
+
+CHIP:
+
+```{r af-vs-depth-chip, fig.height=4.5}
+ggplot(chip_multi, aes(x = DP, y = AF, group = traj_id)) +
+  geom_line(colour = "grey", linewidth = 0.4) +
+  geom_smooth(group = 1, method = "lm") +
+  scale_y_log10()
+
+ggplot(chip_multi, aes(x = DP, y = AF, group = traj_id)) +
+  geom_smooth(colour = "grey", se = FALSE, method = "lm", linewidth = 0.4) +
+  geom_smooth(group = 1, method = "lm") +
+  scale_y_log10()
+```
+
+The two fits as numbers. The slope is that of `log10(AF) ~ DP` over all calls, per 1000 reads of depth;
+calls of one trajectory are not independent, so the interval is too narrow.
+
+```{r af-vs-depth-table}
+bind_rows(chip_multi, nonchip_multi) %>%
+  group_by(CHIP_lab) %>%
+  summarise(trajectories = n_distinct(traj_id),
+            calls = n(),
+            `Spearman rho, AF vs DP` = round(cor(AF, DP, method = "spearman"), 3),
+            fit = list(broom::tidy(lm(log10(AF) ~ I(DP / 1000)), conf.int = TRUE)[2, ]),
+            .groups = "drop") %>%
+  unnest(fit) %>%
+  transmute(CHIP_lab, trajectories, calls, `Spearman rho, AF vs DP`,
+            `slope of log10(AF) per 1000 reads (95% CI)` = sprintf("%.3f (%.3f to %.3f)", estimate, conf.low, conf.high)) %>%
+  knitr::kable()
+```
+
+
+## 6.2 Pileup
+
+### Depth at CHIP and non-CHIP positions
+
+All positions of the two pileup files, all samples.
+
+```{r depth-chip-vs-nonchip, fig.width=5, fig.height=4}
+df <- bind_rows(readcount_chip    %>% select(S_ID, chr, pos, ref, depth) %>% mutate(CHIP = 1),
+                readcount_nonchip %>% select(S_ID, chr, pos, ref, depth) %>% mutate(CHIP = 0))
+
+ggplot(df, aes(y = depth, x = as.factor(CHIP))) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("0" = "non-CHIP positions", "1" = "CHIP positions")) +
+  labs(x = NULL)
+
+t.test(df$depth ~ df$CHIP)
+wilcox.test(df$depth ~ df$CHIP)
+```
+
+### Non-CHIP alleles over time
+
+Every non-CHIP allele with at least one read, in the longitudinal individuals. The bands near 0.5 and 1 are
+germline variants; most of them are not in `merged_vcf` for that individual because Mutect2 flagged them.
+
+```{r nonchip-pileup-all, fig.width=14, fig.height=11}
+nonchip_long_ids <- readcount_nonchip_long %>% filter(longitudinal)
+
+ggplot(nonchip_long_ids, aes(x = Age, y = VAF, group = traj_id)) +
+  geom_point() +
+  geom_line(linewidth = 0.5) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+  facet_wrap(~ID)
+```
+
+Individual SHCS_34. At one timepoint the germline variants leave their bands (homozygous variants drop,
+absent alleles appear): this is the
+sample with the largest share of foreign DNA in section 3.3.
+
+```{r nonchip-pileup-example-mixed, fig.width=8, fig.height=4.5}
+nonchip_long_ids %>%
+  filter(ID == id_of("SHCS_34")) %>%
+  ggplot(aes(x = Age, y = VAF, group = traj_id)) +
+  geom_point() +
+  geom_line(linewidth = 0.5) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed")
+```
+
+Individual SHCS_1, trajectories with a mean VAF below `r chip_vaf`:
+
+```{r nonchip-pileup-example-low-vaf, fig.width=8, fig.height=4.5}
+nonchip_long_ids %>%
+  filter(ID == id_of("SHCS_1")) %>%
+  group_by(traj_id) %>%
+  filter(mean(VAF) < chip_vaf) %>%
+  ggplot(aes(x = Age, y = VAF, group = traj_id)) +
+  geom_point() +
+  geom_line(linewidth = 0.5) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed")
+```
+
+### Mean VAF of the low-VAF trajectories
+
+One row per trajectory with at least one read of the allele. `mean_VAF` and the other statistics are taken
+over the timepoints where the allele was seen. The density of all individuals in the pileup includes
+the individuals with a single sample; the density of the longitudinal individuals is shown next to it.
+
+```{r nonchip-mean-vaf, fig.width=8, fig.height=4}
+Mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# statistics over the timepoints with >= 1 read of the allele; timepoints without a read count as missed
+nonchip_traj <- readcount_all %>%
+  filter(CHIP == 0) %>%
+  group_by(ID, longitudinal, traj_id) %>%
+  summarise(n_timepoints_total    = n(),
+            n_timepoints_detected = sum(alt_count > 0),
+            mean_VAF   = mean(VAF[alt_count > 0]),
+            median_VAF = median(VAF[alt_count > 0]),
+            min_VAF    = min(VAF[alt_count > 0]),
+            max_VAF    = max(VAF[alt_count > 0]),
+            mode_VAF   = Mode(VAF[alt_count > 0]),
+            sd_VAF     = sd(VAF[alt_count > 0]),
+            .groups = "drop") %>%
+  filter(n_timepoints_detected > 0) %>%
+  mutate(CV_VAF = sd_VAF / mean_VAF,
+         n_timepoints_missed = n_timepoints_total - n_timepoints_detected,
+         frac_missed = n_timepoints_missed / n_timepoints_total)
+
+readcount_nonchip_long_sum <- nonchip_traj %>% filter(mean_VAF <= chip_vaf)
+
+bind_rows(readcount_nonchip_long_sum %>% mutate(set = "all individuals in the pileup (original)"),
+          readcount_nonchip_long_sum %>% filter(longitudinal) %>% mutate(set = "longitudinal individuals")) %>%
+  ggplot(aes(x = mean_VAF, colour = set)) +
+  geom_density() +
+  scale_colour_manual(values = c("black", "red3")) +
+  labs(colour = NULL) +
+  theme(legend.position = "bottom")
+
+readcount_nonchip_long_sum %>%
+  select(mean_VAF, median_VAF, min_VAF, max_VAF, mode_VAF) %>%
+  summary()
+
+# most frequent value of mean_VAF, and the peak of its density
+dens <- density(readcount_nonchip_long_sum$mean_VAF)
+c(Mode = Mode(readcount_nonchip_long_sum$mean_VAF), density_peak = dens$x[which.max(dens$y)])
+```
+
+### How often is a low-VAF trajectory missed at a timepoint?
+
+A timepoint is *missed* when the pileup has no read of the allele there. Trajectories with a mean VAF below
+`r chip_vaf` are split into deciles of mean VAF. Only the longitudinal individuals are used: an individual
+with a single sample cannot miss a timepoint.
+
+```{r missed-by-decile}
+add_deciles <- function(traj) {
+  traj %>%
+    filter(mean_VAF < chip_vaf) %>%
+    mutate(VAF_decile = ntile(mean_VAF, 10))
+}
+
+decile_summary <- function(traj) {
+  traj %>%
+    group_by(VAF_decile) %>%
+    summarise(n_trajectories = n(),
+              min_mean_VAF = min(mean_VAF),
+              max_mean_VAF = max(mean_VAF),
+              pct_never_missed = round(100 * mean(n_timepoints_missed == 0), 1),
+              mean_frac_missed = mean(frac_missed),
+              median_frac_missed = median(frac_missed),
+              .groups = "drop")
+}
+
+# deciles x number of missed timepoints, as counts or as % of the decile
+missed_crosstab <- function(traj, percent = FALSE) {
+  traj %>%
+    count(VAF_decile, n_timepoints_missed, name = "n_trajectories") %>%
+    group_by(VAF_decile) %>%
+    mutate(value = if (percent) round(100 * n_trajectories / sum(n_trajectories), 1) else n_trajectories) %>%
+    ungroup() %>%
+    arrange(n_timepoints_missed) %>%
+    select(VAF_decile, n_timepoints_missed, value) %>%
+    pivot_wider(names_from = n_timepoints_missed, values_from = value, names_prefix = "missed_", values_fill = 0) %>%
+    arrange(VAF_decile)
+}
+
+low_vaf_traj <- add_deciles(nonchip_traj %>% filter(longitudinal))
+
+decile_summary(low_vaf_traj) %>% knitr::kable(digits = 5)
+missed_crosstab(low_vaf_traj) %>% knitr::kable(caption = "Trajectories by number of missed timepoints")
+missed_crosstab(low_vaf_traj, percent = TRUE) %>% knitr::kable(caption = "% of the trajectories of the decile")
+```
+
+```{r missed-by-decile-plot, fig.width=8, fig.height=4}
+low_vaf_traj %>%
+  count(VAF_decile, n_timepoints_missed) %>%
+  ggplot(aes(x = factor(VAF_decile), y = n, fill = fct_rev(factor(n_timepoints_missed)))) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  scale_fill_brewer(palette = "YlOrRd", direction = -1) +
+  labs(x = "Decile of mean VAF (trajectories with mean VAF < 0.02)", y = "Trajectories", fill = "Timepoints\nmissed")
+```
+
+The same for *stable* trajectories: coefficient of variation of the VAF (`CV_VAF = sd_VAF / mean_VAF`) at
+or below the median of the low-VAF trajectories. Trajectories seen at a single timepoint have no CV and are
+left out.
+
+```{r missed-stable}
+cv_threshold <- median(low_vaf_traj$CV_VAF, na.rm = TRUE)
+cv_threshold
+
+stable_traj <- low_vaf_traj %>%
+  filter(!is.na(CV_VAF), CV_VAF <= cv_threshold)
+
+decile_summary(stable_traj) %>% knitr::kable(digits = 5)
+missed_crosstab(stable_traj) %>% knitr::kable(caption = "Stable trajectories by number of missed timepoints")
+missed_crosstab(stable_traj, percent = TRUE) %>% knitr::kable(caption = "% of the stable trajectories of the decile")
+```
+
+The same on all individuals in the pileup. The individuals with a single sample never
+miss a timepoint, which raises the share of trajectories that are never missed (left column: all individuals
+in the pileup):
+
+```{r missed-original-set}
+bind_rows(decile_summary(add_deciles(nonchip_traj)) %>% mutate(set = "all individuals in the pileup"),
+          decile_summary(low_vaf_traj) %>% mutate(set = "longitudinal individuals")) %>%
+  transmute(VAF_decile, set, cell = sprintf("%.1f%% of %d", pct_never_missed, n_trajectories)) %>%
+  pivot_wider(names_from = set, values_from = cell) %>%
+  knitr::kable(caption = "Trajectories never missed, by decile of mean VAF")
+```
+
+
+# 7. Limit of detection of non-CHIP variants (`chip_lod`)
+
+## 7.1 Package and data
+
+For a site with depth `n` and `k` reads of the variant allele, `lod_frequentist()` returns:
+
+| column | meaning |
+|---|---|
+| `lambda_bg` | `n * e / 3`, expected number of error reads carrying the specific alternate base |
+| `pvalue` | P(K >= k) under Poisson(`lambda_bg`), i.e. sequencing error alone |
+| `k_star` | smallest read count with `pvalue <= alpha` at this depth |
+| `called` | `k >= k_star` |
+| `lod_vaf` | smallest true VAF that reaches `k_star` reads with probability >= `power_target` at this depth |
+
+`k_star` and `lod_vaf` depend only on depth. The package is in `external/chip_lod`;
+only `model.R` and `lod.R` are sourced, into their own environment.
+
+```{r chip-lod-package}
+chip_lod <- new.env()
+for (f in c("model.R", "lod.R")) {
+  sys.source(file.path("external/chip_lod", "r", "R", f), envir = chip_lod)
+}
+lod_frequentist <- chip_lod$lod_frequentist
+
+# example from the package README
+lod_frequentist(n = c(500, 1000, 2000), k = c(3, 1, 3), e = 0.001)
+```
+
+Two tables go into the calculation, both without the samples with foreign DNA (section 3.3):
+
+- **`lod_calls`**: every non-CHIP Mutect2 call, with Mutect2's own counts (`n = DP`, `k` = alternate reads
+  of `AD`). This covers all variant types.
+- **`lod_obs`**: every non-CHIP SNV and deletion at **every timepoint** of every longitudinal individual,
+  with the pileup counts (`k = 0` where the allele was not seen). This is what a trajectory needs.
+  Insertions and multi-nucleotide variants are not in the pileup (section 3.2), and variants whose pileup
+  counts do not agree with Mutect2 are left out (section 5.1).
+
+```{r lod-data}
+lod_calls <- merged_vcf %>%
+  filter(CHIP == 0, !Sample %in% mixed_samples) %>%
+  left_join(traj_class %>% select(traj_id, class), by = "traj_id") %>%
+  transmute(ID, Sample, Age, variant, traj_id, type, FILTER, class, n = DP, k = alt_count)
+
+lod_obs <- readcount_all %>%
+  filter(CHIP == 0, longitudinal, !S_ID %in% mixed_samples, depth > 0,
+         type %in% c("SNV", "deletion"), variant %in% pileup_ok_variants) %>%
+  left_join(traj_class %>% select(traj_id, class, mutect_called), by = "traj_id") %>%
+  transmute(ID, Sample = S_ID, LABDATE, Age, variant, traj_id, type, class, mutect_called, has_vcf, Detected,
+            n = depth, k = alt_count) %>%
+  group_by(ID) %>%
+  mutate(timepoint = dense_rank(LABDATE)) %>%
+  ungroup()
+
+c(lod_calls = nrow(lod_calls), lod_obs = nrow(lod_obs), lod_obs_trajectories = n_distinct(lod_obs$traj_id),
+  samples_in_lod_obs = n_distinct(lod_obs$Sample), individuals = n_distinct(lod_obs$ID))
+```
+
+`lod_frequentist()` is run once on the distinct (`n`, `k`) pairs of both tables and joined back. The
+bisection in the package takes about 40 ms per distinct depth (2 to 3 minutes for this chunk).
+
+```{r lod-run}
+lod_pairs <- bind_rows(lod_calls %>% distinct(n, k), lod_obs %>% distinct(n, k)) %>%
+  distinct()
+
+lod_tab <- lod_frequentist(n = lod_pairs$n, k = lod_pairs$k,
+                           e = err_rate, alpha = alpha, power_target = power_tgt)
+stopifnot(all(lod_tab$n == lod_pairs$n), all(lod_tab$k == lod_pairs$k))
+
+# vaf is the raw read fraction k / n, on the same scale as lod_vaf
+add_lod <- function(df) {
+  df %>%
+    left_join(lod_tab, by = c("n", "k")) %>%
+    mutate(vaf = k / n,
+           status = case_when(is.na(lod_vaf) ~ NA_character_,
+                              !called        ~ "not called (k < k*)",
+                              vaf < lod_vaf  ~ "called, VAF < LoD",
+                              TRUE           ~ "VAF >= LoD"),
+           status = factor(status, levels = status_levels))
+}
+
+lod_calls <- add_lod(lod_calls)
+lod_obs   <- add_lod(lod_obs)
+
+# at very low depth no VAF up to 0.5 reaches the target power, and the package returns no LoD
+c(lod_obs_without_LoD = sum(is.na(lod_obs$lod_vaf)), lod_calls_without_LoD = sum(is.na(lod_calls$lod_vaf)))
+lod_obs   <- lod_obs %>% filter(!is.na(lod_vaf))
+lod_calls <- lod_calls %>% filter(!is.na(lod_vaf))
+```
+
+`status` combines the two package results for each observation:
+
+- **not called (k < k\*)**: the reads are compatible with sequencing error alone.
+- **called, VAF < LoD**: more reads than error explains, but a variant of this size would be missed in more
+  than `r 100 * (1 - power_tgt)`% of measurements at this depth.
+- **VAF >= LoD**: reliably detectable at this depth. This is "above the LoD" below.
+
+Groups of trajectories used below:
+
+```{r lod-groups}
+group_levels <- c("Mutect2-called, potential somatic", "Mutect2-called, potential germline",
+                  "pileup only, potential somatic", "pileup only, potential germline")
+
+lod_obs <- lod_obs %>%
+  mutate(group = factor(paste0(ifelse(mutect_called, "Mutect2-called, ", "pileup only, "), class), levels = group_levels))
+
+lod_obs %>%
+  group_by(group) %>%
+  summarise(trajectories = n_distinct(traj_id), variants = n_distinct(variant), individuals = n_distinct(ID),
+            observations = n(), `observations with a Mutect2 call` = sum(Detected)) %>%
+  knitr::kable()
+```
+
+*Mutect2-called*: Mutect2 called the variant in at least one sample of the individual. *Pileup only*: the
+variant was called in other individuals but never in this one; these trajectories show what the same sites
+look like without a call.
+
+
+## 7.2 Limit of detection of the observations
+
+```{r lod-summary}
+lod_obs %>%
+  group_by(group) %>%
+  summarise(observations = n(),
+            `depth, median (IQR)` = med_iqr(n),
+            `depth, range` = paste(range(n), collapse = "-"),
+            `k*, range` = paste(range(k_star), collapse = "-"),
+            `LoD VAF %, median (IQR)` = med_iqr(lod_vaf, 2, 100),
+            `LoD VAF %, range` = paste(round(100 * range(lod_vaf), 2), collapse = "-"),
+            `LoD <= 0.5% VAF` = percent(mean(lod_vaf <= 0.005), accuracy = 0.1),
+            `LoD <= 1% VAF` = percent(mean(lod_vaf <= 0.01), accuracy = 0.1),
+            `LoD <= 2% VAF` = percent(mean(lod_vaf <= chip_vaf), accuracy = 0.1)) %>%
+  knitr::kable()
+
+# all observations together
+lod_obs %>%
+  summarise(observations = n(),
+            `depth, median (IQR)` = med_iqr(n),
+            `k* (share of observations)` = paste(sprintf("%d: %.1f%%", as.integer(names(table(k_star))),
+                                                        100 * prop.table(table(k_star))), collapse = ", "),
+            `LoD VAF %, median (IQR)` = med_iqr(lod_vaf, 2, 100),
+            `LoD VAF %, 5th-95th percentile` = paste(round(100 * quantile(lod_vaf, c(0.05, 0.95)), 2), collapse = "-")) %>%
+  knitr::kable()
+```
+
+The LoD is a property of depth, so it is the same for all groups. Every observed depth with its `k_star`
+and `lod_vaf`, and the depth distribution of the observations:
+
+```{r lod-curve, fig.height=5.5}
+lod_curve <- lod_obs %>%
+  distinct(n, k_star, lod_vaf) %>%
+  arrange(n)
+
+p_curve <- ggplot(lod_curve, aes(x = n, y = lod_vaf, colour = factor(k_star))) +
+  geom_point(size = 0.7) +
+  geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+  scale_x_log10(limits = range(lod_curve$n)) +
+  scale_y_log10(labels = percent) +
+  labs(x = NULL, y = "LoD VAF", colour = "k*")
+
+p_depth <- ggplot(lod_obs, aes(x = n)) +
+  geom_histogram(bins = 80, fill = "grey60") +
+  scale_x_log10(limits = range(lod_curve$n)) +
+  labs(x = "Depth at the variant site", y = "Observations")
+
+ggarrange(p_curve, p_depth, ncol = 1, heights = c(1.6, 1), align = "v", legend = "right")
+```
+
+
+## 7.3 How many variants are above the LoD
+
+### Mutect2 calls (Mutect2 read counts)
+
+Every non-CHIP call, all variant types.
+
+```{r lod-calls}
+lod_calls %>%
+  mutate(filter = ifelse(FILTER == "PASS", "PASS", "other flags")) %>%
+  group_by(class, filter) %>%
+  summarise(calls = n(),
+            `depth, median (IQR)` = med_iqr(n),
+            `alt reads, median (IQR)` = med_iqr(k),
+            `LoD VAF %, median (IQR)` = med_iqr(lod_vaf, 2, 100),
+            `VAF %, median (IQR)` = med_iqr(vaf, 2, 100),
+            `called (k >= k*)` = n_pct(called),
+            `VAF >= LoD` = n_pct(status == "VAF >= LoD"),
+            `lowest VAF / LoD` = round(min(vaf / lod_vaf), 2),
+            .groups = "drop") %>%
+  knitr::kable()
+
+# potential somatic calls by variant type
+lod_calls %>%
+  filter(class == "potential somatic") %>%
+  group_by(type) %>%
+  summarise(calls = n(),
+            variants = n_distinct(variant),
+            `VAF %, median (IQR)` = med_iqr(vaf, 2, 100),
+            `called (k >= k*)` = n_pct(called),
+            `VAF >= LoD` = n_pct(status == "VAF >= LoD")) %>%
+  knitr::kable()
+```
+
+### All timepoints (pileup read counts)
+
+```{r lod-status-table}
+status_table <- function(df, ...) {
+  df %>%
+    count(..., status) %>%
+    group_by(...) %>%
+    mutate(cell = sprintf("%d (%.1f%%)", n, 100 * n / sum(n)), observations = sum(n)) %>%
+    ungroup() %>%
+    select(-n) %>%
+    pivot_wider(names_from = status, values_from = cell, values_fill = "0", names_sort = TRUE)
+}
+
+status_table(lod_obs, group) %>% knitr::kable()
+```
+
+Mutect2-called trajectories, split by whether Mutect2 called the variant in that sample. A few timepoints
+of the pileup have no Mutect2 VCF (section 3.1) and are shown separately.
+
+```{r lod-status-by-call}
+lod_obs <- lod_obs %>%
+  mutate(sample_call = case_when(!has_vcf      ~ "no VCF for this sample",
+                                 Detected == 1 ~ "Mutect2 call in this sample",
+                                 TRUE          ~ "no Mutect2 call in this sample"))
+
+lod_obs %>%
+  filter(mutect_called) %>%
+  status_table(group, sample_call) %>%
+  knitr::kable()
+```
+
+```{r lod-status-plot, fig.width=9, fig.height=3.5}
+lod_obs %>%
+  ggplot(aes(y = fct_rev(group), fill = fct_rev(status))) +
+  geom_bar(position = "fill") +
+  scale_x_continuous(labels = percent) +
+  scale_fill_manual(values = status_colors, breaks = status_levels) +
+  labs(x = "Observations", y = NULL, fill = NULL)
+```
+
+Observed reads against the thresholds. Each point is one observation with at least one read of the allele.
+Solid line: `lod_vaf`. Dotted line: `k_star / depth`, the read fraction needed to be called.
+
+```{r lod-vaf-vs-depth, fig.width=12, fig.height=7}
+vaf_trans  <- pseudo_log_trans(sigma = 2e-4, base = 10)
+vaf_breaks <- c(0, 0.001, 0.005, 0.02, 0.1, 0.5)
+
+lod_obs %>%
+  filter(k > 0) %>%
+  ggplot(aes(x = n, y = vaf)) +
+  geom_point(aes(colour = status), size = 0.5, alpha = 0.4) +
+  geom_line(data = lod_curve, aes(y = lod_vaf, linetype = "LoD VAF")) +
+  geom_line(data = lod_curve, aes(y = k_star / n, linetype = "k* / depth")) +
+  scale_x_log10() +
+  scale_y_continuous(trans = vaf_trans, breaks = vaf_breaks, labels = percent_format(accuracy = 0.1)) +
+  scale_colour_manual(values = status_colors) +
+  scale_linetype_manual(values = c("LoD VAF" = "solid", "k* / depth" = "dotted")) +
+  facet_wrap(~group) +
+  labs(x = "Depth", y = "Observed VAF (k / n)", colour = NULL, linetype = NULL) +
+  guides(colour = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+  theme(legend.position = "bottom")
+```
+
+
+## 7.4 VAF of the variants above and below the LoD
+
+```{r lod-vaf-by-status}
+lod_obs %>%
+  group_by(group, status) %>%
+  summarise(observations = n(),
+            `alt reads, median (IQR)` = med_iqr(k),
+            `VAF %, mean` = round(100 * mean(vaf), 3),
+            `VAF %, median (IQR)` = med_iqr(vaf, 3, 100),
+            `VAF %, range` = paste(round(100 * range(vaf), 3), collapse = "-"),
+            `LoD VAF %, median` = round(100 * median(lod_vaf), 2),
+            .groups = "drop") %>%
+  knitr::kable()
+```
+
+```{r lod-vaf-by-status-plot, fig.width=11, fig.height=4.5}
+ggplot(lod_obs, aes(x = status, y = vaf, fill = status)) +
+  geom_boxplot(outlier.size = 0.3, outlier.alpha = 0.3) +
+  geom_hline(yintercept = median(lod_obs$lod_vaf), linetype = "dashed") +
+  scale_y_continuous(trans = vaf_trans, breaks = vaf_breaks, labels = percent_format(accuracy = 0.1)) +
+  scale_x_discrete(labels = function(x) gsub(", | \\(", "\n(", x) %>% gsub("\n\\(VAF", "\nVAF", .)) +
+  scale_fill_manual(values = status_colors, guide = "none") +
+  facet_wrap(~group, nrow = 1, labeller = label_wrap_gen(22)) +
+  labs(x = NULL, y = "Observed VAF (k / n)")
+```
+
+Dashed line: median LoD VAF.
+
+
+## 7.5 Trajectories: do they stay above the LoD?
+
+One row per trajectory, over all timepoints of the individual (timepoints without a read count as VAF 0).
+
+```{r lod-trajectories}
+consistency_levels <- c("all timepoints above LoD", "some timepoints above LoD", "no timepoint above LoD")
+
+lod_traj <- lod_obs %>%
+  group_by(group, class, mutect_called, ID, variant, traj_id, type) %>%
+  summarise(timepoints = n(),
+            n_above    = sum(status == "VAF >= LoD"),
+            n_called   = sum(called),
+            n_mutect   = sum(Detected),
+            mean_vaf   = mean(vaf),
+            min_vaf    = min(vaf),
+            max_vaf    = max(vaf),
+            mean_vaf_above = mean(vaf[status == "VAF >= LoD"]),
+            mean_lod   = mean(lod_vaf),
+            .groups = "drop") %>%
+  mutate(frac_above  = n_above / timepoints,
+         consistency = factor(case_when(n_above == timepoints ~ consistency_levels[1],
+                                        n_above == 0          ~ consistency_levels[3],
+                                        TRUE                  ~ consistency_levels[2]),
+                              levels = consistency_levels)) %>%
+  # Mutect2 PASS calls of the trajectory, and number of individuals in which the variant is called
+  left_join(lod_calls %>% group_by(traj_id) %>% summarise(n_pass = sum(FILTER == "PASS")), by = "traj_id") %>%
+  left_join(nonchip_recurrence %>% select(variant, N_IDs), by = "variant") %>%
+  mutate(n_pass = replace_na(n_pass, 0L))
+
+table(timepoints_per_trajectory = lod_traj$timepoints)
+```
+
+```{r lod-trajectories-table}
+lod_traj %>%
+  count(group, consistency) %>%
+  group_by(group) %>%
+  mutate(cell = sprintf("%d (%.1f%%)", n, 100 * n / sum(n)), trajectories = sum(n)) %>%
+  ungroup() %>%
+  select(-n) %>%
+  pivot_wider(names_from = consistency, values_from = cell, values_fill = "0") %>%
+  knitr::kable()
+```
+
+Mean VAF of the trajectories. `mean VAF` is the mean over all timepoints of a trajectory; the table gives
+the mean and the median of this value over the trajectories of each row.
+
+```{r lod-trajectories-vaf}
+lod_traj %>%
+  group_by(group, consistency) %>%
+  summarise(trajectories = n(),
+            variants = n_distinct(variant),
+            `timepoints above LoD, mean` = round(mean(n_above), 2),
+            `mean VAF %, mean over trajectories` = round(100 * mean(mean_vaf), 3),
+            `mean VAF %, median (IQR)` = med_iqr(mean_vaf, 3, 100),
+            `lowest VAF of the trajectory %, median` = round(100 * median(min_vaf), 3),
+            `highest VAF of the trajectory %, median` = round(100 * median(max_vaf), 3),
+            .groups = "drop") %>%
+  knitr::kable()
+```
+
+```{r lod-trajectories-plot, fig.width=12, fig.height=4.5}
+p_frac <- lod_traj %>%
+  count(group, n_above) %>%
+  ggplot(aes(y = fct_rev(group), x = n, fill = fct_rev(factor(n_above)))) +
+  geom_col(position = "fill") +
+  scale_x_continuous(labels = percent) +
+  scale_y_discrete(labels = label_wrap(18)) +
+  scale_fill_brewer(palette = "Blues", direction = -1) +
+  labs(x = "Trajectories", y = NULL, fill = "Timepoints\nabove LoD")
+
+p_mean <- lod_traj %>%
+  filter(mutect_called) %>%
+  ggplot(aes(x = consistency, y = mean_vaf, fill = consistency)) +
+  geom_boxplot(outlier.size = 0.4) +
+  geom_hline(yintercept = median(lod_obs$lod_vaf), linetype = "dashed") +
+  scale_y_continuous(trans = vaf_trans, breaks = vaf_breaks, labels = percent_format(accuracy = 0.1)) +
+  scale_x_discrete(labels = c("all", "some", "none")) +
+  scale_fill_manual(values = setNames(c("#2a78d6", "#E69F00", "#898781"), consistency_levels), guide = "none") +
+  facet_wrap(~group, labeller = label_wrap_gen(22)) +
+  labs(x = "Timepoints above LoD", y = "Mean VAF of the trajectory")
+
+ggarrange(p_frac, p_mean, ncol = 2, labels = c("A", "B"), widths = c(1.15, 1))
+```
+
+A: trajectories by number of timepoints above the LoD. B: mean VAF of the Mutect2-called trajectories;
+dashed line: median LoD VAF.
+
+Potential somatic trajectories with a Mutect2 call, by number of individuals in which the same variant is
+called (all samples, section 2.2), and by whether the trajectory has a `PASS` call. A variant called in most
+individuals is a property of the site (artefact or polymorphism), not a clone.
+
+```{r lod-trajectories-recurrence}
+consistency_summary <- function(traj) {
+  traj %>%
+    summarise(variants = n_distinct(variant),
+              trajectories = n(),
+              `all timepoints above LoD` = n_pct(consistency == consistency_levels[1]),
+              `some` = n_pct(consistency == consistency_levels[2]),
+              `none` = n_pct(consistency == consistency_levels[3]),
+              `mean VAF %, median (IQR)` = med_iqr(mean_vaf, 3, 100),
+              .groups = "drop")
+}
+
+som_traj <- lod_traj %>%
+  filter(group == "Mutect2-called, potential somatic") %>%
+  mutate(`individuals with a call` = cut(N_IDs, c(0, 1, 5, 20, Inf), labels = c("1", "2-5", "6-20", "> 20")),
+         `PASS call in the trajectory` = ifelse(n_pass > 0, "yes", "no"))
+
+som_traj %>% group_by(`individuals with a call`) %>% consistency_summary() %>% knitr::kable()
+som_traj %>% group_by(`PASS call in the trajectory`) %>% consistency_summary() %>% knitr::kable()
+som_traj %>%
+  filter(N_IDs == 1) %>%
+  group_by(`individuals with a call`, `PASS call in the trajectory`) %>%
+  consistency_summary() %>%
+  knitr::kable(caption = "Variants called in a single individual")
+```
+
+Example trajectories: potential somatic, Mutect2-called, above the LoD at some timepoints only (the 24 with
+the highest VAF). Dashed line: LoD at each timepoint.
+
+```{r lod-trajectories-examples, fig.width=13, fig.height=7}
+example_ids <- lod_traj %>%
+  filter(group == "Mutect2-called, potential somatic", consistency == consistency_levels[2]) %>%
+  slice_max(max_vaf, n = 24, with_ties = FALSE) %>%
+  pull(traj_id)
+
+lod_obs %>%
+  filter(traj_id %in% example_ids) %>%
+  ggplot(aes(x = Age)) +
+  geom_line(aes(y = lod_vaf), linetype = "dashed", linewidth = 0.4) +
+  geom_line(aes(y = vaf), colour = "grey60", linewidth = 0.4) +
+  geom_point(aes(y = vaf, colour = status, shape = sample_call), size = 1.8) +
+  scale_y_continuous(trans = vaf_trans, breaks = vaf_breaks, labels = percent_format(accuracy = 0.1)) +
+  scale_colour_manual(values = status_colors, drop = FALSE) +
+  scale_shape_manual(values = c("Mutect2 call in this sample" = 17, "no Mutect2 call in this sample" = 16,
+                                "no VCF for this sample" = 1)) +
+  facet_wrap(~traj_id, ncol = 6, scales = "free_x") +
+  labs(x = "Age", y = "Observed VAF (k / n)", colour = NULL, shape = NULL) +
+  theme_classic(base_size = 10) +
+  theme(legend.position = "bottom", strip.text = element_text(size = 6.5))
+```
+
+
+## 7.6 Stringent set: PASS calls of non-recurrent variants
+
+Most of the potential somatic trajectories above carry Mutect2 filter flags or belong to variants that occur
+in many individuals. The stringent set keeps a trajectory only if
+
+1. Mutect2 called the variant with `FILTER == "PASS"` in at least one sample of the individual, and
+2. the variant is found in at most `r max_individuals` of the `r length(long_ids)` individuals
+   (`max_individuals`). "Found" is counted in two ways, and both have to hold: individuals with a Mutect2
+   call of the variant under any filter (section 2.2), and individuals in whose pileup the variant is above
+   the LoD at one timepoint or more.
+
+The pileup count is needed because Mutect2 can call a variant in one individual although the same reads are
+in the pileup of most others.
+
+```{r lod-stringent-set}
+# individuals in whose pileup each variant is above the LoD at >= 1 timepoint
+pileup_recurrence <- lod_obs %>%
+  group_by(variant) %>%
+  summarise(ids_above_lod = n_distinct(ID[status == "VAF >= LoD"]), .groups = "drop")
+
+lod_traj <- lod_traj %>%
+  left_join(pileup_recurrence, by = "variant") %>%
+  mutate(stringent = group == "Mutect2-called, potential somatic" & n_pass > 0 &
+                     N_IDs <= max_individuals & ids_above_lod <= max_individuals)
+
+som_all <- lod_traj %>% filter(group == "Mutect2-called, potential somatic")
+
+tibble(step = c("potential somatic trajectories with a Mutect2 call, followed in the pileup",
+                "... with a PASS call",
+                paste("... and variant called by Mutect2 in <=", max_individuals, "individuals"),
+                paste("... and variant above the LoD in the pileup of <=", max_individuals, "individuals: stringent set")),
+       keep = list(rep(TRUE, nrow(som_all)),
+                   som_all$n_pass > 0,
+                   som_all$n_pass > 0 & som_all$N_IDs <= max_individuals,
+                   som_all$stringent)) %>%
+  mutate(trajectories = map_int(keep, sum),
+         variants     = map_int(keep, ~ n_distinct(som_all$variant[.x])),
+         individuals  = map_int(keep, ~ n_distinct(som_all$ID[.x]))) %>%
+  select(-keep) %>%
+  knitr::kable()
+
+stringent_traj <- lod_traj %>% filter(stringent)
+stringent_obs  <- lod_obs %>% filter(traj_id %in% stringent_traj$traj_id)
+
+# potential somatic trajectories with a PASS call that are not followed in the pileup
+pass_traj_ids <- lod_calls %>% filter(class == "potential somatic", FILTER == "PASS") %>% distinct(traj_id, type)
+table(type = pass_traj_ids$type, followed_in_pileup = pass_traj_ids$traj_id %in% lod_traj$traj_id)
+```
+
+The second table counts the potential somatic trajectories with a `PASS` call by variant type. Those that
+are not followed in the pileup are insertions, multi-nucleotide variants and variants whose pileup counts do
+not agree with Mutect2 (sections 3.2 and 5.1); they are not part of the stringent set.
+
+The two counts of recurrence for the variants with a `PASS` call. Dashed lines: `max_individuals`.
+
+```{r lod-stringent-recurrence, fig.width=6.5, fig.height=4.5}
+som_all %>%
+  filter(n_pass > 0) %>%
+  distinct(variant, type, N_IDs, ids_above_lod) %>%
+  ggplot(aes(x = N_IDs, y = ids_above_lod, colour = type)) +
+  geom_hline(yintercept = max_individuals + 0.5, linetype = "dashed") +
+  geom_vline(xintercept = max_individuals + 0.5, linetype = "dashed") +
+  geom_jitter(width = 0.25, height = 0.25, size = 1.3, alpha = 0.7) +
+  labs(x = "Individuals with a Mutect2 call of the variant (any filter)",
+       y = "Individuals with the variant above the LoD\nin the pileup (>= 1 timepoint)", colour = NULL)
+```
+
+### Observations
+
+```{r lod-stringent-status}
+bind_rows(stringent_obs %>% mutate(sample_call = "all timepoints"), stringent_obs) %>%
+  mutate(sample_call = fct_relevel(sample_call, "all timepoints")) %>%
+  status_table(sample_call) %>%
+  knitr::kable()
+
+stringent_obs %>%
+  group_by(status) %>%
+  summarise(observations = n(),
+            `alt reads, median (IQR)` = med_iqr(k),
+            `VAF %, mean` = round(100 * mean(vaf), 3),
+            `VAF %, median (IQR)` = med_iqr(vaf, 3, 100),
+            `VAF %, range` = paste(round(100 * range(vaf), 3), collapse = "-"),
+            `LoD VAF %, median` = round(100 * median(lod_vaf), 2)) %>%
+  knitr::kable()
+```
+
+### Trajectories
+
+```{r lod-stringent-trajectories}
+stringent_traj %>%
+  group_by(consistency) %>%
+  summarise(trajectories = n(),
+            variants = n_distinct(variant),
+            individuals = n_distinct(ID),
+            `timepoints above LoD, mean` = round(mean(n_above), 2),
+            `mean VAF %, mean over trajectories` = round(100 * mean(mean_vaf), 3),
+            `mean VAF %, median (IQR)` = med_iqr(mean_vaf, 3, 100),
+            `lowest VAF of the trajectory %, median` = round(100 * median(min_vaf), 3),
+            `highest VAF of the trajectory %, median` = round(100 * median(max_vaf), 3)) %>%
+  mutate(`% of trajectories` = round(100 * trajectories / sum(trajectories), 1), .after = trajectories) %>%
+  knitr::kable()
+```
+
+Order of the timepoints above the LoD. A clone that appears and persists is above the LoD from one
+timepoint through the last.
+
+```{r lod-stringent-pattern}
+# above: is the trajectory above the LoD, timepoints in time order
+above_pattern <- function(above) {
+  n <- length(above)
+  k <- sum(above)
+  if (k == n) return("all timepoints")
+  if (k == 0) return("no timepoint")
+  first <- min(which(above))
+  last  <- max(which(above))
+  if (last - first + 1 > k) return("intermittent")
+  if (last == n) return("from one timepoint through the last")
+  if (first == 1) return("from the first timepoint, then lost")
+  "one block in between"
+}
+pattern_levels <- c("all timepoints", "from one timepoint through the last", "from the first timepoint, then lost",
+                    "one block in between", "intermittent", "no timepoint")
+
+stringent_traj <- stringent_traj %>%
+  left_join(stringent_obs %>%
+              arrange(traj_id, LABDATE) %>%
+              group_by(traj_id) %>%
+              summarise(pattern = above_pattern(status == "VAF >= LoD"), .groups = "drop"),
+            by = "traj_id") %>%
+  mutate(pattern = factor(pattern, levels = pattern_levels))
+
+stringent_traj %>%
+  group_by(pattern) %>%
+  summarise(trajectories = n(),
+            `timepoints above LoD, median` = median(n_above),
+            `Mutect2 calls, median` = median(n_mutect),
+            `mean VAF %, median (IQR)` = med_iqr(mean_vaf, 3, 100),
+            `highest VAF %, median (IQR)` = med_iqr(max_vaf, 2, 100)) %>%
+  mutate(`% of trajectories` = round(100 * trajectories / sum(trajectories), 1), .after = trajectories) %>%
+  knitr::kable()
+```
+
+Every trajectory of the stringent set. One row per trajectory, one column per timepoint of the individual
+(samples with foreign DNA left out); number: VAF in %; triangle: Mutect2 call in that sample (filled: `PASS`).
+
+```{r lod-stringent-heatmap, fig.width=9, fig.height=max(4, 0.15 * nrow(stringent_traj) + 2.5)}
+stringent_obs %>%
+  left_join(stringent_traj %>% select(traj_id, pattern, max_vaf), by = "traj_id") %>%
+  left_join(lod_calls %>% transmute(traj_id, Sample, call = ifelse(FILTER == "PASS", "PASS", "other flags")),
+            by = c("traj_id", "Sample")) %>%
+  ggplot(aes(x = factor(timepoint), y = fct_reorder(traj_id, max_vaf))) +
+  geom_tile(aes(fill = status), colour = "white") +
+  geom_text(aes(label = ifelse(k > 0, sprintf("%.2f", 100 * vaf), "")), size = 2.2, hjust = 1, nudge_x = 0.38) +
+  geom_point(aes(shape = call), size = 1.3, position = position_nudge(x = -0.33), na.rm = TRUE) +
+  scale_fill_manual(values = alpha(status_colors, 0.55), drop = FALSE) +
+  scale_shape_manual(values = c("PASS" = 17, "other flags" = 2), na.translate = FALSE, name = "Mutect2 call") +
+  facet_grid(pattern ~ ., scales = "free_y", space = "free_y", labeller = label_wrap_gen(14)) +
+  labs(x = "Timepoint of the individual", y = NULL, fill = NULL) +
+  theme(axis.text.y = element_text(size = 6), strip.text.y = element_text(angle = 0, size = 7),
+        legend.position = "bottom", legend.box = "vertical")
+```
+
+### Other limits for the number of individuals
+
+The same trajectories with a `PASS` call, for other values of `max_individuals` (applied to both counts).
+
+```{r lod-stringent-threshold}
+map_dfr(c(1, 2, 5, 10, Inf), function(m) {
+  som_all %>%
+    filter(n_pass > 0, N_IDs <= m, ids_above_lod <= m) %>%
+    summarise(`max_individuals` = ifelse(is.finite(m), as.character(m), "no limit"),
+              trajectories = n(),
+              variants = n_distinct(variant),
+              `all timepoints above LoD` = n_pct(consistency == consistency_levels[1]),
+              `some` = n_pct(consistency == consistency_levels[2]),
+              `none` = n_pct(consistency == consistency_levels[3]),
+              `mean VAF %, all / some / none` = paste(sprintf("%.2f", 100 * tapply(mean_vaf, consistency, mean)), collapse = " / "))
+}) %>%
+  knitr::kable()
+```
+
+
+## 7.7 Samples with foreign DNA
+
+The same headline numbers with the `r length(mixed_samples)` flagged samples included, for the Mutect2-called
+potential somatic trajectories. The class of 4.2 is recalculated with all samples.
+
+```{r lod-sensitivity}
+class_all_samples <- full_join(
+  mutect_rule(merged_vcf %>% filter(CHIP == 0)),
+  readcount_all %>%
+    filter(CHIP == 0, longitudinal, depth > 0) %>%
+    group_by(ID, variant, traj_id) %>%
+    summarise(pileup_median_VAF = median(VAF), .groups = "drop"),
+  by = c("ID", "variant", "traj_id")) %>%
+  filter(!is.na(class_mutect),
+         class_mutect == "potential somatic", !coalesce(pileup_median_VAF >= low_af_max, FALSE))
+
+obs_all_samples <- readcount_all %>%
+  filter(traj_id %in% class_all_samples$traj_id, depth > 0,
+         type %in% c("SNV", "deletion"), variant %in% pileup_ok_variants) %>%
+  transmute(traj_id, n = depth, k = alt_count)
+
+# depths of the flagged samples that are not yet in lod_tab
+new_pairs <- obs_all_samples %>% distinct(n, k) %>% anti_join(lod_tab, by = c("n", "k"))
+lod_tab_all <- bind_rows(lod_tab, lod_frequentist(n = new_pairs$n, k = new_pairs$k,
+                                                 e = err_rate, alpha = alpha, power_target = power_tgt))
+
+headline <- function(obs) {
+  obs %>%
+    filter(!is.na(lod_vaf)) %>%
+    mutate(above = k / n >= lod_vaf) %>%
+    group_by(traj_id) %>%
+    summarise(timepoints = n(), n_above = sum(above), .groups = "drop") %>%
+    summarise(trajectories = n(),
+              observations = sum(timepoints),
+              `observations above LoD` = sprintf("%d (%.1f%%)", sum(n_above), 100 * sum(n_above) / sum(timepoints)),
+              `all timepoints above LoD` = n_pct(n_above == timepoints),
+              `some` = n_pct(n_above > 0 & n_above < timepoints),
+              `none` = n_pct(n_above == 0))
+}
+
+bind_rows(
+  lod_obs %>% filter(group == "Mutect2-called, potential somatic") %>% headline() %>%
+    mutate(samples = "flagged samples left out (sections 7.2 to 7.6)"),
+  obs_all_samples %>% left_join(lod_tab_all, by = c("n", "k")) %>% headline() %>%
+    mutate(samples = "all samples")) %>%
+  relocate(samples) %>%
+  knitr::kable()
+```
+
+
+## 7.8 Summary
+
+```{r lod-headline, include=FALSE}
+som <- lod_obs %>% filter(group == "Mutect2-called, potential somatic")
+bg  <- lod_obs %>% filter(group == "pileup only, potential somatic")
+bg_traj <- lod_traj %>% filter(group == "pileup only, potential somatic")
+som_calls <- lod_calls %>%
+  filter(class == "potential somatic") %>%
+  left_join(nonchip_recurrence %>% select(variant, N_IDs), by = "variant")
+all_above <- consistency_levels[1]
+pct <- function(x, accuracy = 0.1) percent(x, accuracy = accuracy)
+traj_share    <- function(traj, level) pct(mean(traj$consistency == level))
+traj_mean_vaf <- function(traj, level) pct(mean(traj$mean_vaf[traj$consistency == level]), 0.01)
+```
+
+- **Limit of detection.** Over the `r nrow(lod_obs)` observations (non-CHIP SNVs and deletions at every
+  timepoint of the `r n_distinct(lod_obs$ID)` longitudinal individuals) the median depth is
+  `r median(lod_obs$n)` and the median LoD is a VAF of `r pct(median(lod_obs$lod_vaf), 0.01)` (IQR
+  `r pct(quantile(lod_obs$lod_vaf, 0.25), 0.01)` to `r pct(quantile(lod_obs$lod_vaf, 0.75), 0.01)`, range
+  `r pct(min(lod_obs$lod_vaf), 0.01)` to `r pct(max(lod_obs$lod_vaf), 0.01)`), with `k_star` between
+  `r min(lod_obs$k_star)` and `r max(lod_obs$k_star)` reads. `r sum(lod_obs$lod_vaf > chip_vaf)` observations
+  have a LoD above the CHIP threshold of `r pct(chip_vaf, 1)`.
+- **Mutect2 calls.** With Mutect2's own read counts, `r pct(mean(lod_calls$status == "VAF >= LoD"))` of the
+  `r nrow(lod_calls)` non-CHIP calls are above the LoD (`r sum(lod_calls$status != "VAF >= LoD")` are not);
+  among the potential somatic calls it is
+  `r pct(mean(lod_calls$status[lod_calls$class == "potential somatic"] == "VAF >= LoD"))`.
+- **Potential somatic variants that Mutect2 called, at all timepoints** (`r nrow(som_traj)` trajectories of
+  `r n_distinct(som_traj$variant)` variants): `r pct(mean(som$status == "VAF >= LoD"))` of the `r nrow(som)`
+  observations are above the LoD, `r pct(mean(som$status == "called, VAF < LoD"))` are called but below it
+  and `r pct(mean(som$status == "not called (k < k*)"))` are not called. Median VAF: 
+  `r pct(median(som$vaf[som$status == "VAF >= LoD"]), 0.01)` above the LoD,
+  `r pct(median(som$vaf[som$status == "called, VAF < LoD"]), 0.01)` called but below it,
+  `r pct(median(som$vaf[som$status == "not called (k < k*)"]), 0.01)` not called.
+- **Trajectories of these variants.** `r traj_share(som_traj, consistency_levels[1])` are above the LoD at
+  all timepoints (mean VAF of these trajectories `r traj_mean_vaf(som_traj, consistency_levels[1])`),
+  `r traj_share(som_traj, consistency_levels[2])` at some timepoints (mean VAF
+  `r traj_mean_vaf(som_traj, consistency_levels[2])`) and `r traj_share(som_traj, consistency_levels[3])` at
+  none (mean VAF `r traj_mean_vaf(som_traj, consistency_levels[3])`).
+- **Which trajectories stay above the LoD.** `r pct(mean(som_traj$N_IDs[som_traj$consistency == all_above] > 20))`
+  of the trajectories that are above the LoD at all timepoints belong to the
+  `r n_distinct(som_traj$variant[som_traj$N_IDs > 20])` variants that are called in more than 20 individuals.
+  Of the `r sum(som_traj$N_IDs == 1)` trajectories of variants called in a single individual,
+  `r pct(mean(som_traj$consistency[som_traj$N_IDs == 1] == all_above))` are above the LoD at all timepoints.
+- **Stringent set** (trajectories with a `PASS` call of a variant found in at most `r max_individuals`
+  individuals, section 7.6; `r nrow(stringent_traj)` trajectories of `r n_distinct(stringent_traj$variant)`
+  variants in `r n_distinct(stringent_traj$ID)` individuals): `r pct(mean(stringent_obs$status == "VAF >= LoD"))`
+  of the `r nrow(stringent_obs)` observations are above the LoD (median VAF
+  `r pct(median(stringent_obs$vaf[stringent_obs$status == "VAF >= LoD"]), 0.01)`),
+  `r pct(mean(stringent_obs$status == "called, VAF < LoD"))` are called but below it (median VAF
+  `r pct(median(stringent_obs$vaf[stringent_obs$status == "called, VAF < LoD"]), 0.01)`) and
+  `r pct(mean(stringent_obs$status == "not called (k < k*)"))` are not called.
+  `r traj_share(stringent_traj, consistency_levels[1])` of the trajectories are above the LoD at all timepoints
+  (mean VAF `r traj_mean_vaf(stringent_traj, consistency_levels[1])`),
+  `r traj_share(stringent_traj, consistency_levels[2])` at some (mean VAF
+  `r traj_mean_vaf(stringent_traj, consistency_levels[2])`) and
+  `r traj_share(stringent_traj, consistency_levels[3])` at none (mean VAF
+  `r traj_mean_vaf(stringent_traj, consistency_levels[3])`).
+  `r sum(stringent_traj$pattern == "from one timepoint through the last")` of the
+  `r sum(stringent_traj$consistency == consistency_levels[2])` trajectories that are above the LoD at some
+  timepoints are above it from one timepoint through the last; `r sum(stringent_traj$n_above == 1)`
+  trajectories are above it at a single timepoint.
+- **Same sites without a call** (pileup only, potential somatic; `r nrow(bg_traj)` trajectories):
+  `r pct(mean(bg$called))` of the observations reach `k_star` and `r pct(mean(bg$status == "VAF >= LoD"))`
+  are above the LoD, where sequencing error at rate `e` alone gives at most `r pct(alpha, 1)` that reach
+  `k_star`. `r traj_share(bg_traj, consistency_levels[1])` of these trajectories are above the LoD at all
+  timepoints. These sites are not a random sample: each one is a site where Mutect2 made a call in another
+  individual.
+
+Points to keep in mind when reading these numbers:
+
+- Being above the LoD says that the reads are more than random sequencing error at rate `e`. It does not
+  say that the variant is a clone. Of the potential somatic non-CHIP calls,
+  `r pct(mean(som_calls$FILTER != "PASS"))` carry Mutect2 filter flags and `r pct(mean(som_calls$N_IDs > 20))`
+  belong to variants that are called in more than 20 individuals. This is what a site-specific artefact
+  looks like, and such an artefact is above the LoD at every timepoint.
+- The error background `e / 3` describes base substitutions with one rate for all sites. The same rule is
+  applied to deletions here.
+- The pileup counts are not filtered on base quality; Mutect2's counts are.
+- `alpha` is a per-site rate, without correction for the number of sites.
+- Insertions and multi-nucleotide variants are only in the Mutect2-based table.
+
+
+# 8. Theoretical LoD and the data (paper figures)
+
+Figures and numbers for the paper, for two cohorts:
+
+- **SHCS**: the CHIP measurements of the paper, `results/SHCS_CHIP_variants_depth_LoD.txt` (written by
+  `02_SHCS_CHIP_trajectories.Rmd`): depth and variant reads of every timepoint of every
+  trajectory, from the Mutect2 call, from bam-readcount, or not detected (no variant read).
+- **SardiNIA**: the trajectories of the analysis (`resources/LoD/sardinia_chip_calls_long_filtered.txt`, written by
+  `04_SardiNIA_CHIP_trajectories.Rmd`),
+  with the read counts of `ALLvariants_exclSynonymous_Xadj.txt`.
+  The variant reads are the raw reads (`TOTALcount - WTcount`); `MUTcount_Xadj` is halved for X-linked variants
+  in men.
+
+The four figures and their assembly, Figure S2 (`FigS2_LoD_depth_kstar`), are written to
+`output/Supplementary_Figures/` as png and svg when `write_paper_figures` is `TRUE`. The tables are only shown here.
+
+## 8.1 Data
+
+```{r paper-inputs}
+# section 8 needs the trajectory tables of both cohorts (02_SHCS_CHIP_trajectories.Rmd, 04_SardiNIA_CHIP_trajectories.Rmd);
+# on the first run of the pipeline the notebook stops here, and run_all.R knits it again at the end
+paper_inputs <- c("results/SHCS_CHIP_variants_depth_LoD.txt", "resources/LoD/sardinia_chip_calls_long_filtered.txt")
+if (!all(file.exists(paper_inputs))) knitr::knit_exit("Section 8 is skipped: the trajectory tables do not exist yet.")
+```
+
+```{r paper-data}
+source("R/Set_colors.R")                  # hiv_colors: SHCS red, SardiNIA grey
+cohort_levels <- c("SHCS", "Sardinia")
+cohort_colors <- hiv_colors[cohort_levels]
+
+shcs_meas <- read.delim("results/SHCS_CHIP_variants_depth_LoD.txt") %>%
+  transmute(cohort = "SHCS", id = SHCS_ID, traj_id = Trajectory, n = Depth, k = Alt_reads, lod_table = LoD,
+            group = recode(Source, "Mutect2" = "Mutect2 call", "bam-readcount" = "bam-readcount",
+                           "imputed" = "not detected (k = 0)"))
+
+sard_set <- read.table("resources/LoD/sardinia_chip_calls_long_filtered.txt", sep = "\t", header = TRUE) %>%
+  transmute(SardID = as.integer(sub("Sard_", "", SardID)), CHR = as.character(Chr), START = Start, END = End, REF = Ref, ALT = Alt) %>%
+  distinct()
+
+sard_meas <- read.table("resources/SardiNIA/ALLvariants_exclSynonymous_Xadj.txt", sep = "\t", header = TRUE) %>%
+  filter(!is.na(TOTALcount)) %>%
+  semi_join(sard_set, by = c("SardID", "CHR", "START", "END", "REF", "ALT")) %>%
+  transmute(cohort = "Sardinia", id = paste0("Sard_", SardID), traj_id = paste(id, Gene, CHR, START, REF, ALT, sep = ":"),
+            n = TOTALcount, k = TOTALcount - WTcount, lod_table = NA_real_,
+            group = ifelse(k > 0, "variant reads (k >= 1)", "not detected (k = 0)"))
+
+# measurements of the CHIP clones and of the stringent non-CHIP set with a Mutect2 VCF (for section 8.4)
+detection_obs <- bind_rows(
+  readcount_all %>%
+    filter(CHIP == 1, longitudinal, has_vcf, !S_ID %in% mixed_samples, depth > 0, type %in% c("SNV", "deletion")) %>%
+    group_by(traj_id) %>%
+    filter(sum(Detected) > 0) %>%
+    ungroup() %>%
+    transmute(set = "CHIP clones", traj_id, n = depth, k = alt_count, Detected),
+  stringent_obs %>%
+    filter(has_vcf) %>%
+    transmute(set = "non-CHIP, stringent set", traj_id, n, k, Detected))
+
+# k*, called and LoD of every measurement; lod_tab (section 7) already has many of the (n, k) pairs
+new_pairs <- bind_rows(shcs_meas, sard_meas, detection_obs) %>%
+  distinct(n, k) %>%
+  anti_join(lod_tab, by = c("n", "k"))
+lod_tab_paper <- bind_rows(lod_tab, lod_frequentist(n = new_pairs$n, k = new_pairs$k,
+                                                    e = err_rate, alpha = alpha, power_target = power_tgt))
+add_lod_paper <- function(df) {
+  df %>%
+    left_join(lod_tab_paper %>% select(n, k, k_star, called, lod_vaf), by = c("n", "k")) %>%
+    mutate(vaf = k / n)
+}
+
+cohort_meas   <- add_lod_paper(bind_rows(shcs_meas, sard_meas)) %>%
+  mutate(cohort = factor(cohort, levels = cohort_levels),
+         group  = factor(group, levels = c("Mutect2 call", "bam-readcount", "variant reads (k >= 1)", "not detected (k = 0)")))
+detection_obs <- add_lod_paper(detection_obs)
+
+# the LoD in the SHCS table is the same calculation (rounded there)
+stopifnot(!anyNA(cohort_meas$lod_vaf),
+          all(abs(cohort_meas$lod_table - cohort_meas$lod_vaf) / cohort_meas$lod_vaf < 0.01, na.rm = TRUE))
+
+cohort_meas %>%
+  group_by(cohort, group) %>%
+  summarise(measurements = n(), individuals = n_distinct(id), trajectories = n_distinct(traj_id), .groups = "drop") %>%
+  knitr::kable()
+```
+
+Error background in SHCS: CHIP positions in the samples of individuals who carry nothing there (no Mutect2
+call and no allele at 1% or more at that position), without the samples with foreign DNA (section 3.3) and
+without any site where a non-reference base reaches 1%. Each site gives three (site, alternate base) pairs,
+with `k` the reads of that base. There is no such background for SardiNIA, whose table only has the carriers.
+
+```{r paper-background}
+carrier_pos <- readcount_all %>%
+  filter(Detected == 1 | VAF >= 0.01) %>%
+  distinct(ID, chr, pos)
+
+background_pairs <- pileup_sites %>%
+  semi_join(readcount_chip %>% distinct(chr, pos), by = c("chr", "pos")) %>%
+  inner_join(samples %>% filter(ID %in% long_ids) %>% select(Sample, ID), by = c("S_ID" = "Sample")) %>%
+  filter(!S_ID %in% mixed_samples, depth > 0) %>%
+  anti_join(carrier_pos, by = c("ID", "chr", "pos")) %>%
+  crossing(allele = c("A", "C", "G", "T")) %>%
+  filter(allele != ref) %>%
+  left_join(pileup_alleles, by = c("S_ID", "chr", "pos", "allele")) %>%
+  mutate(k = replace_na(count, 0L)) %>%
+  group_by(S_ID, chr, pos) %>%
+  filter(max(k / depth) < 0.01) %>%
+  ungroup() %>%
+  transmute(S_ID, ID, chr, pos, substitution = paste0(ref, ">", allele), n = depth, k)
+
+# k* at each depth, and the share of error-only sites that the model expects to reach it
+background_kstar <- tibble(n = unique(background_pairs$n)) %>%
+  mutate(k_star = map_int(n, function(n) chip_lod$k_star(n, err_rate, alpha)),
+         fp_model = map2_dbl(k_star, n, function(ks, n) chip_lod$pvalue(ks, n, err_rate)))
+background_pairs <- background_pairs %>% left_join(background_kstar, by = "n")
+
+c(pairs = nrow(background_pairs), positions = nrow(distinct(background_pairs, chr, pos)),
+  samples = n_distinct(background_pairs$S_ID), individuals = n_distinct(background_pairs$ID))
+```
+
+Theoretical `k*` and LoD over depth, for the error rate used (`e = 0.001`) and for half and twice that rate.
+`k*` is calculated for every depth, the LoD on a grid of depths and on both sides of every step of `k*`.
+
+```{r paper-theory}
+e_curves    <- c(err_rate / 2, err_rate, 2 * err_rate)
+depth_range <- c(100, 8000)
+
+# k* never decreases with depth, so each search starts at the k* of the previous depth
+theory_kstar <- map_dfr(e_curves, function(e) {
+  n  <- depth_range[1]:depth_range[2]
+  ks <- integer(length(n))
+  k  <- 0L
+  for (i in seq_along(n)) {
+    while (chip_lod$pvalue(k, n[i], e) > alpha) k <- k + 1L
+    ks[i] <- k
+  }
+  tibble(e = e, n = n, k_star = ks)
+})
+
+theory_steps <- theory_kstar %>%
+  group_by(e) %>%
+  filter(k_star != lag(k_star)) %>%
+  ungroup()
+
+theory_lod <- bind_rows(
+  expand_grid(e = e_curves, n = c(unique(round(10^seq(log10(depth_range[1]), log10(depth_range[2]), length.out = 150))),
+                                  500, 1000, 2000, 3000)),
+  theory_steps %>% select(e, n),
+  theory_steps %>% transmute(e, n = n - 1)) %>%
+  mutate(n = as.integer(n)) %>%
+  distinct() %>%
+  filter(n >= depth_range[1]) %>%
+  left_join(theory_kstar, by = c("e", "n")) %>%
+  mutate(lod_vaf = pmap_dbl(list(n, e, k_star), function(n, e, ks) chip_lod$lod_vaf(n, e, alpha, power_tgt, ks))) %>%
+  arrange(e, n)
+
+e_label  <- function(e) factor(paste("e =", format(e, scientific = FALSE, drop0trailing = TRUE)),
+                               levels = paste("e =", format(e_curves, scientific = FALSE, drop0trailing = TRUE)))
+e_lines  <- setNames(c("dotted", "solid", "dashed"), levels(e_label(e_curves)))
+theory_kstar <- theory_kstar %>% mutate(e_lab = e_label(e))
+theory_lod   <- theory_lod %>% mutate(e_lab = e_label(e))
+
+# the points a step line needs: first and last depth, and every depth at which k* changes
+step_points <- function(df) {
+  df %>%
+    group_by(e) %>%
+    filter(row_number() == 1 | row_number() == n() | k_star != lag(k_star)) %>%
+    ungroup()
+}
+
+# depths at which k* (e = 0.001) goes up by one read
+theory_steps %>% filter(e == err_rate) %>% transmute(depth = n, k_star) %>% knitr::kable()
+```
+
+
+## 8.2 Theoretical k* and LoD over depth
+
+Lines: theory for three error rates. Shaded: interquartile range of the depth of the measurements of each cohort.
+Margins: depth of the measurements (top) and their `k*` or LoD at `e = 0.001` (right). `k*` takes whole
+values, so its margin shows the share of measurements at each value instead of a density.
+
+```{r paper-figure-helpers}
+paper_theme  <- theme_classic(base_size = 11)
+margin_theme <- theme_void() + theme(plot.margin = margin(0, 0, 0, 0))
+
+# main plot with a density margin on top and on the right, legends of the main plot on the right
+with_margins <- function(main, top, right) {
+  top + plot_spacer() + main + right +
+    plot_layout(ncol = 2, widths = c(4, 1), heights = c(1, 4), guides = "collect")
+}
+
+save_paper_figure <- function(plot, name, width = 7, height = 5) {
+  if (!write_paper_figures) return(invisible(NULL))
+  dir.create(paper_fig_dir, showWarnings = FALSE, recursive = TRUE)
+  for (ext in c("png", "svg")) {
+    ggsave(file.path(paper_fig_dir, paste0(name, ".", ext)), plot, width = width, height = height, dpi = 300, bg = "white")
+  }
+}
+
+depth_scale <- scale_x_log10(limits = depth_range, breaks = c(100, 300, 1000, 3000))
+cohort_labels <- c(SHCS = "SHCS", Sardinia = "SardiNIA")
+cohort_fill   <- scale_fill_manual(values = cohort_colors, labels = cohort_labels, name = "Cohort\n(depth IQR)")
+cohort_colour <- scale_colour_manual(values = cohort_colors, guide = "none")
+
+depth_iqr <- cohort_meas %>%
+  group_by(cohort) %>%
+  summarise(lo = quantile(n, 0.25), hi = quantile(n, 0.75), .groups = "drop")
+
+p_depth_margin <- ggplot(cohort_meas, aes(n, fill = cohort, colour = cohort)) +
+  geom_density(alpha = 0.3, linewidth = 0.3) +
+  depth_scale + cohort_colour +
+  scale_fill_manual(values = cohort_colors, guide = "none") +
+  margin_theme
+```
+
+```{r paper-figure-kstar, fig.width=7, fig.height=5}
+kstar_max <- max(theory_kstar$k_star)
+
+p_kstar <- ggplot() +
+  geom_rect(data = depth_iqr, aes(xmin = lo, xmax = hi, ymin = -Inf, ymax = Inf, fill = cohort), alpha = 0.25) +
+  geom_step(data = step_points(theory_kstar), aes(n, k_star, linetype = e_lab), linewidth = 0.5) +
+  depth_scale +
+  scale_y_continuous(limits = c(0.5, kstar_max + 0.5), breaks = 1:kstar_max) +
+  cohort_fill +
+  scale_linetype_manual(values = e_lines, name = "Error rate") +
+  labs(x = "Depth at the variant site", y = "k* (variant reads needed)") +
+  paper_theme
+
+# share of the measurements at each k*, the two cohorts side by side
+p_kstar_margin <- cohort_meas %>%
+  count(cohort, k_star, name = "measurements") %>%
+  group_by(cohort) %>%
+  mutate(share = measurements / sum(measurements),
+         offset = ifelse(cohort == "SHCS", -0.18, 0.18)) %>%
+  ungroup() %>%
+  ggplot(aes(xmin = 0, xmax = share, ymin = k_star + offset - 0.16, ymax = k_star + offset + 0.16, fill = cohort)) +
+  geom_rect(alpha = 0.6) +
+  scale_y_continuous(limits = c(0.5, kstar_max + 0.5)) +
+  scale_fill_manual(values = cohort_colors, guide = "none") +
+  margin_theme
+
+fig_kstar <- with_margins(p_kstar, p_depth_margin, p_kstar_margin)
+fig_kstar
+save_paper_figure(fig_kstar, "LoD_theory_kstar_vs_depth")
+```
+
+```{r paper-figure-lod, fig.width=7, fig.height=5}
+lod_lim   <- range(c(theory_lod$lod_vaf, cohort_meas$lod_vaf))
+lod_scale <- scale_y_log10(limits = lod_lim,
+                           breaks = c(0.001, 0.002, 0.005, 0.01, 0.02, 0.05), labels = label_percent(accuracy = 0.1))
+
+p_lod <- ggplot() +
+  geom_rect(data = depth_iqr, aes(xmin = lo, xmax = hi, ymin = lod_lim[1], ymax = lod_lim[2], fill = cohort), alpha = 0.25) +
+  geom_line(data = theory_lod, aes(n, lod_vaf, linetype = e_lab), linewidth = 0.5) +
+  depth_scale + lod_scale +
+  cohort_fill +
+  scale_linetype_manual(values = e_lines, name = "Error rate") +
+  labs(x = "Depth at the variant site", y = "LoD (VAF)") +
+  paper_theme
+
+p_lod_margin <- ggplot(cohort_meas, aes(y = lod_vaf, fill = cohort, colour = cohort)) +
+  geom_density(alpha = 0.3, linewidth = 0.3) +
+  lod_scale + cohort_colour +
+  scale_fill_manual(values = cohort_colors, guide = "none") +
+  margin_theme
+
+fig_lod <- with_margins(p_lod, p_depth_margin, p_lod_margin)
+fig_lod
+save_paper_figure(fig_lod, "LoD_theory_LoD_vs_depth")
+```
+
+
+## 8.3 Measurements against k*
+
+Each point is one measurement: its depth and its number of variant reads. Line: `k*` at `e = 0.001`, the reads
+needed for a call. Margins: density of depth (top) and of variant reads (right) for each group of
+measurements; the read densities use a narrow bandwidth on the log scale and are scaled to the same height,
+so that the measurements without a variant read show as a peak at 0. In SHCS the grey points are the error background (section 8.1; a random sample of 15,000 of
+the pairs within the depth range of the measurements, drawn with a small vertical jitter). Colours are the R
+defaults.
+
+```{r paper-figure-reads-helper}
+reads_scale <- function(max_k) {
+  scale_y_continuous(trans = pseudo_log_trans(sigma = 1, base = 10), limits = c(-0.4, max_k * 1.15),
+                     breaks = c(0, 1, 2, 3, 5, 10, 30, 100, 300, 1000))
+}
+
+# meas: n, k, group; background: n, k (optional)
+plot_reads_vs_kstar <- function(meas, group_levels, background = NULL, background_label = NULL) {
+  meas <- meas %>% mutate(group = factor(group, levels = group_levels))
+  group_cols <- setNames(hue_pal()(length(group_levels)), group_levels)     # R's default colours
+  depth_lim  <- range(meas$n) * c(0.95, 1.05)
+  x_scale    <- scale_x_log10(limits = depth_lim)
+  y_scale    <- reads_scale(max(meas$k))
+  kline      <- step_points(theory_kstar %>% filter(e == err_rate, n >= depth_lim[1], n <= depth_lim[2]))
+
+  main <- ggplot()
+  if (!is.null(background)) {
+    main <- main + geom_point(data = background, aes(n, k_jitter, colour = background_label), size = 0.3, alpha = 0.35)
+  }
+  point_cols <- group_cols
+  if (!is.null(background)) point_cols[background_label] <- "grey65"
+  main <- main +
+    geom_step(data = kline, aes(n, k_star, linetype = paste0("k* (e = ", err_rate, ")")), linewidth = 0.5) +
+    geom_point(data = meas, aes(n, k, colour = group), size = 1.2, alpha = 0.85) +
+    scale_colour_manual(values = point_cols, breaks = names(point_cols), name = NULL) +
+    scale_linetype_manual(values = "solid", name = NULL) +
+    guides(colour = guide_legend(override.aes = list(size = 2.2, alpha = 1), order = 1),
+           linetype = guide_legend(order = 2)) +
+    x_scale + y_scale +
+    labs(x = "Depth at the variant site", y = "Variant reads (k)") +
+    paper_theme
+
+  top <- ggplot(meas, aes(n, fill = group, colour = group)) +
+    geom_density(alpha = 0.3, linewidth = 0.3) +
+    x_scale +
+    scale_fill_manual(values = group_cols, guide = "none") + scale_colour_manual(values = group_cols, guide = "none") +
+    margin_theme
+
+  # a narrow bandwidth (log scale) keeps the "k = 0" group at 0; each group is scaled to its own peak
+  right <- ggplot(meas, aes(y = k, x = after_stat(scaled), fill = group, colour = group)) +
+    geom_density(alpha = 0.3, linewidth = 0.3, bw = 0.08) +
+    y_scale +
+    scale_fill_manual(values = group_cols, guide = "none") + scale_colour_manual(values = group_cols, guide = "none") +
+    margin_theme
+
+  with_margins(main, top, right)
+}
+```
+
+SHCS:
+
+```{r paper-figure-reads-shcs, fig.width=7, fig.height=5}
+shcs_plot_meas <- cohort_meas %>% filter(cohort == "SHCS")
+shcs_depth_lim <- range(shcs_plot_meas$n) * c(0.95, 1.05)
+
+set.seed(1)
+background_plot <- background_pairs %>%
+  filter(n >= shcs_depth_lim[1], n <= shcs_depth_lim[2]) %>%
+  slice_sample(n = 15000) %>%
+  mutate(k_jitter = k + runif(n(), -0.15, 0.15))
+
+fig_reads_shcs <- plot_reads_vs_kstar(shcs_plot_meas,
+                                      group_levels = c("Mutect2 call", "bam-readcount", "not detected (k = 0)"),
+                                      background = background_plot,
+                                      background_label = "background (no variant expected)")
+fig_reads_shcs
+save_paper_figure(fig_reads_shcs, "LoD_SHCS_reads_vs_kstar")
+```
+
+SardiNIA (no background):
+
+```{r paper-figure-reads-sardinia, fig.width=7, fig.height=5}
+fig_reads_sard <- plot_reads_vs_kstar(cohort_meas %>% filter(cohort == "Sardinia"),
+                                      group_levels = c("variant reads (k >= 1)", "not detected (k = 0)"))
+fig_reads_sard
+save_paper_figure(fig_reads_sard, "LoD_SardiNIA_reads_vs_kstar")
+```
+
+Figure S2 of the paper: the four figures as panels a-d.
+
+```{r paper-figure-S2, fig.width=14, fig.height=10}
+fig_s2 <- wrap_plots(wrap_elements(full = fig_kstar), wrap_elements(full = fig_lod),
+                     wrap_elements(full = fig_reads_shcs), wrap_elements(full = fig_reads_sard), ncol = 2) +
+  plot_annotation(tag_levels = "a") & theme(plot.tag = element_text(size = 16, face = "bold"))
+fig_s2
+save_paper_figure(fig_s2, "FigS2_LoD_depth_kstar", width = 14, height = 10)
+```
+
+
+## 8.4 Numbers for the text
+
+### LoD of the measurements
+
+```{r paper-table-lod}
+cohort_meas %>%
+  group_by(cohort) %>%
+  summarise(measurements = n(),
+            individuals = n_distinct(id),
+            trajectories = n_distinct(traj_id),
+            `depth, median (IQR)` = med_iqr(n),
+            `depth, range` = paste(range(n), collapse = "-"),
+            `k*: share of measurements` = paste(sprintf("%d: %.1f%%", as.integer(names(table(k_star))),
+                                                        100 * prop.table(table(k_star))), collapse = ", "),
+            `LoD VAF %, median (IQR)` = med_iqr(lod_vaf, 2, 100),
+            `LoD VAF %, range` = paste(round(100 * range(lod_vaf), 2), collapse = "-"),
+            `LoD <= 0.5%` = percent(mean(lod_vaf <= 0.005), accuracy = 0.1),
+            `LoD <= 1%` = percent(mean(lod_vaf <= 0.01), accuracy = 0.1)) %>%
+  knitr::kable()
+```
+
+### Measurements against k* and the LoD
+
+```{r paper-table-measurements}
+cohort_meas %>%
+  group_by(cohort, group) %>%
+  summarise(measurements = n(),
+            `k = 0` = n_pct(k == 0),
+            `0 < k < k*` = n_pct(k > 0 & !called),
+            `k >= k* (called)` = n_pct(called),
+            `VAF >= LoD` = n_pct(vaf >= lod_vaf),
+            `variant reads, median (IQR)` = med_iqr(k),
+            `VAF %, median (IQR)` = med_iqr(vaf, 2, 100),
+            .groups = "drop") %>%
+  knitr::kable()
+```
+
+### Error background against the model (SHCS)
+
+```{r paper-table-background}
+e_fit <- 3 * sum(background_pairs$k) / sum(background_pairs$n)
+e_ci  <- 3 * c(qchisq(0.025, 2 * sum(background_pairs$k)) / 2, qchisq(0.975, 2 * (sum(background_pairs$k) + 1)) / 2) /
+  sum(background_pairs$n)
+
+tibble(`(site, base) pairs` = nrow(background_pairs),
+       positions = nrow(distinct(background_pairs, chr, pos)),
+       samples = n_distinct(background_pairs$S_ID),
+       `depth, median (IQR)` = med_iqr(background_pairs$n),
+       `e used` = err_rate,
+       `e estimated, 3 x reads / depth (95% CI)` = sprintf("%.5f (%.5f-%.5f)", e_fit, e_ci[1], e_ci[2]),
+       `k >= k*, observed` = percent(mean(background_pairs$k >= background_pairs$k_star), accuracy = 0.01),
+       `k >= k*, expected by the model` = percent(mean(background_pairs$fp_model), accuracy = 0.01),
+       alpha = percent(alpha)) %>%
+  knitr::kable()
+
+# distribution of the reads of a background pair: observed, and Poisson with the e used and with the estimated e
+k_levels <- c(as.character(0:5), ">= 6")
+pois_share <- function(e) {
+  lambda <- background_pairs$n * e / 3
+  c(sapply(0:5, function(j) mean(dpois(j, lambda))), mean(ppois(5, lambda, lower.tail = FALSE)))
+}
+tibble(`variant reads` = k_levels,
+       `observed %` = round(100 * c(sapply(0:5, function(j) mean(background_pairs$k == j)), mean(background_pairs$k >= 6)), 3),
+       `Poisson, e used %` = round(100 * pois_share(err_rate), 3),
+       `Poisson, e estimated %` = round(100 * pois_share(e_fit), 3)) %>%
+  knitr::kable()
+```
+
+By substitution (with 95% Poisson interval):
+
+```{r paper-table-substitution}
+background_pairs %>%
+  group_by(substitution) %>%
+  summarise(pairs = n(),
+            `k >= k*` = percent(mean(k >= k_star), accuracy = 0.1),
+            reads = sum(k),
+            depth = sum(n),
+            .groups = "drop") %>%
+  mutate(e = 3 * reads / depth,
+         lo = 3 * qchisq(0.025, 2 * reads) / 2 / depth,
+         hi = 3 * qchisq(0.975, 2 * (reads + 1)) / 2 / depth) %>%
+  arrange(-e) %>%
+  transmute(substitution, pairs, `e estimated (95% CI)` = sprintf("%.5f (%.5f-%.5f)", e, lo, hi), `k >= k*`) %>%
+  knitr::kable()
+```
+
+### Detection by Mutect2 against the LoD (SHCS)
+
+Measurements of variants that are present in the individual (CHIP clones with a Mutect2 call, and the
+stringent non-CHIP set of section 7.6), in samples with a Mutect2 VCF: share called by Mutect2, by the pileup
+VAF relative to the LoD at that depth (95% exact binomial interval).
+
+```{r paper-table-mutect2}
+detection_obs %>%
+  mutate(ratio = vaf / lod_vaf,
+         `VAF / LoD` = ifelse(k == 0, "no variant read", as.character(cut(ratio, c(0, 0.5, 1, 1.5, 2, 3, 5, 10, Inf))))) %>%
+  arrange(ratio) %>%
+  mutate(`VAF / LoD` = fct_inorder(`VAF / LoD`)) %>%
+  group_by(set, `VAF / LoD`) %>%
+  summarise(measurements = n(), called = sum(Detected == 1), .groups = "drop") %>%
+  mutate(ci = map2(called, measurements, function(x, n) binom.test(x, n)$conf.int),
+         `called by Mutect2` = sprintf("%.1f%% (%.1f-%.1f)", 100 * called / measurements,
+                                       100 * map_dbl(ci, 1), 100 * map_dbl(ci, 2))) %>%
+  select(-ci, -called) %>%
+  pivot_wider(names_from = set, values_from = c(measurements, `called by Mutect2`), names_glue = "{set}: {.value}") %>%
+  knitr::kable()
+```
+
+### Summary
+
+```{r paper-summary-values, include=FALSE}
+shcs_m <- cohort_meas %>% filter(cohort == "SHCS")
+sard_m <- cohort_meas %>% filter(cohort == "Sardinia")
+pct_k  <- function(x, value) percent(mean(x == value), accuracy = 0.1)
+det_r  <- detection_obs %>% filter(set == "CHIP clones") %>% mutate(r = vaf / lod_vaf)
+```
+
+- **Theory.** At `e = 0.001` and `alpha = 0.05`, `k*` is 2 variant reads from a depth of
+  `r theory_steps$n[theory_steps$e == err_rate & theory_steps$k_star == 2]`, 3 from
+  `r theory_steps$n[theory_steps$e == err_rate & theory_steps$k_star == 3]` and 4 from `r theory_steps$n[theory_steps$e == err_rate & theory_steps$k_star == 4]`.
+  The LoD falls with depth, from
+  `r percent(theory_lod$lod_vaf[theory_lod$e == err_rate & theory_lod$n == 1000], accuracy = 0.01)` at depth 1,000 to
+  `r percent(theory_lod$lod_vaf[theory_lod$e == err_rate & theory_lod$n == 2000], accuracy = 0.01)` at 2,000 (table below).
+- **SHCS.** The `r nrow(shcs_m)` measurements of the `r n_distinct(shcs_m$traj_id)` CHIP trajectories have a median
+  depth of `r median(shcs_m$n)` (IQR `r round(quantile(shcs_m$n, 0.25))`-`r round(quantile(shcs_m$n, 0.75))`); `k*` is 3 reads for
+  `r pct_k(shcs_m$k_star, 3)` of them and the median LoD is `r percent(median(shcs_m$lod_vaf), accuracy = 0.01)`
+  (range `r percent(min(shcs_m$lod_vaf), accuracy = 0.01)`-`r percent(max(shcs_m$lod_vaf), accuracy = 0.01)`).
+- **SardiNIA.** The `r nrow(sard_m)` measurements of the `r n_distinct(sard_m$traj_id)` trajectories have a median
+  depth of `r median(sard_m$n)` (IQR `r round(quantile(sard_m$n, 0.25))`-`r round(quantile(sard_m$n, 0.75))`) and a median LoD of
+  `r percent(median(sard_m$lod_vaf), accuracy = 0.01)` (range `r percent(min(sard_m$lod_vaf), accuracy = 0.01)`-`r percent(max(sard_m$lod_vaf), accuracy = 0.01)`).
+- **Measurements against k\*.** In SHCS `r sum(shcs_m$group == "Mutect2 call" & shcs_m$vaf >= shcs_m$lod_vaf)` of the
+  `r sum(shcs_m$group == "Mutect2 call")` Mutect2 measurements are above the LoD; of the `r sum(shcs_m$group == "bam-readcount")` measurements from bam-readcount,
+  `r sum(shcs_m$group == "bam-readcount" & shcs_m$called)` reach `k*` and
+  `r sum(shcs_m$group == "bam-readcount" & shcs_m$vaf >= shcs_m$lod_vaf)` are above the LoD. In SardiNIA
+  `r percent(mean(sard_m$vaf >= sard_m$lod_vaf), accuracy = 0.1)` of the measurements are above the LoD and
+  `r sum(sard_m$k == 0)` have no variant read.
+- **Error background.** At `r format(nrow(background_pairs), big.mark = ",")` (site, base) pairs at CHIP positions
+  where no variant is expected, the error rate estimated from the reads is `r sprintf("%.5f", e_fit)`, against
+  `r err_rate` used, and `r percent(mean(background_pairs$k >= background_pairs$k_star), accuracy = 0.1)` of the pairs
+  reach `k*` (`r percent(mean(background_pairs$fp_model), accuracy = 0.1)` expected by the model, at most
+  `r percent(alpha)` by construction). The counts are more dispersed than Poisson: the error rate differs between
+  substitutions (table above).
+- **Detection by Mutect2.** Of the CHIP clone measurements with a VAF below the LoD, Mutect2 called
+  `r sum(det_r$Detected[det_r$r < 1])` of `r sum(det_r$r < 1)`; with a VAF of 5 times the LoD or more it called
+  `r percent(mean(det_r$Detected[det_r$r >= 5] == 1), accuracy = 0.1)`.
+
+```{r paper-summary-lod-points}
+theory_lod %>%
+  filter(e == err_rate, n %in% c(500, 1000, 2000, 3000)) %>%
+  transmute(depth = n, k_star, `LoD VAF %` = round(100 * lod_vaf, 3)) %>%
+  knitr::kable()
+```
+
+
+# 9. Differences from an earlier version of this notebook
+
+The plots and tables of an earlier version of this notebook are reproduced. Where the result is not identical, the
+reason is one of the following.
+
+1. **Alternate read count of Mutect2.** The earlier version took the first value of `AD` for both `ref_count` and
+   `alt_count`. `alt_count` is now the second value. No plot of the earlier version used it; section 7.3 does.
+2. **CHIP flag.** Same rule (position within 1 bp). The three merges and the removal of duplicates are
+   replaced by a direct test, with the same flag for every call. Annotation columns of the Vanderbilt table
+   are not carried along, except the gene.
+3. **Duplicated pileup rows.** Overlapping regions list some positions more than once per sample. The
+   earlier version counted these rows two to sixteen times in `readcount_nonchip_long`; they are now removed. This
+   changes `sd_VAF`, the CV threshold and the tables of stable trajectories.
+4. **Individuals with a single sample.** The pileup also contains individuals with one sample. They are kept
+   in `readcount_all`, but the missed-timepoint tables (section 6.2) use the longitudinal individuals only.
+   The last table of that section shows the difference.
+5. **The sample piled up twice.** Its two pileup runs carry suffixed names, did not match the manifest and
+   formed an individual `NA` in the earlier version. One of the runs is now used as this sample (section 3.1), so
+   individual SHCS_40 has all six timepoints in the pileup. The pileup-based plots of this individual have
+   one timepoint more than in the earlier version.
+6. **Mutect2 against bam-readcount (section 5.1).** The earlier version matched on individual, chromosome,
+   position and date, using the table before duplicates were removed. That pairs different alleles at one
+   position, repeats some calls and loses the deletions (VCF and pileup positions differ). Calls are now
+   matched on sample and exact variant.
+7. **Detected against not detected (section 5.2).** The last two chunks of the earlier version used
+   `readcount_variants`, which was not defined anywhere in it, so they stopped with an error. It is
+   rebuilt here as all variants in all samples with a Mutect2 VCF, with `Detected` for CHIP and non-CHIP
+   variants and zero counts included. The summary table and tests of that section are on this table (the
+   earlier version used the CHIP rows with at least one read, in all pileup samples).
+8. **Region lists.** Not written unless `write_region_files` is `TRUE`, with the corrected insertion
+   position and under new file names.
+9. **Smaller changes.** `ylim()` followed by `scale_y_log10()` had no effect in the earlier version and is
+   dropped; the AF boxplot uses `coord_cartesian()` so that the box is computed on all values; individuals
+   without CHIP are derived instead of hard-coded; all plots use `theme_classic()`.
+
+New in this version: the table of filter flags (1.1), exact against position-based CHIP (2.2), recurrence
+of non-CHIP variants (2.2), samples with foreign DNA (3.3), the pileup check of the germline split (4.2),
+non-CHIP calls and the agreement per variant in the Mutect2 against bam-readcount comparison (5.1), the fits
+of AF against depth as numbers (6.1), the missed-timepoint plot (6.2), and sections 7 and 8.
+
+# Session
+
+```{r session}
+sessionInfo()
+```

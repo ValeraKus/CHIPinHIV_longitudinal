@@ -1,0 +1,262 @@
+---
+title: "CHIP SardiNIA and SHCS trajectories: splines and derivatives with the trajectory-specific LoD"
+author: "Valeriia Timonina"
+date: "2026-11-03"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+params:
+  cross_sectional: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 5)
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+library(gridExtra)
+```
+
+```{r paths}
+# cross_sectional = TRUE: the SHCS trajectories with the cross-sectional calls, read from and written to their own folders
+lod_sub <- if (params$cross_sectional) "LoD/cross_sectional" else "LoD"
+resources_lod <- file.path("resources", lod_sub)
+results_lod   <- file.path("results", lod_sub)
+figures_lod   <- file.path("figures", lod_sub)
+for (d in c(resources_lod, results_lod, figures_lod)) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+shcs_calls_file <- if (params$cross_sectional) file.path(resources_lod, "chip_calls_long_filtered.txt") else "resources/chip_calls_long_filtered.txt"
+```
+
+`r if (params$cross_sectional) "**Sensitivity analysis: this run uses the SHCS trajectories that include the cross-sectional calls.** The paths named in the text are those of the main analysis; this run reads and writes the folders cross_sectional under them."`
+
+
+```{r colors}
+source("R/Set_colors.R")
+source("R/spline_functions.R")
+```
+
+Spline fits of the SHCS and SardiNIA trajectories, with the VAF speed and acceleration.
+
+- **Trajectories.** SardiNIA: `resources/LoD/sardinia_chip_calls_long_filtered.txt` (`1_variant_calls/04_SardiNIA_CHIP_trajectories.Rmd`).
+  SHCS: `resources/chip_calls_long_filtered.txt` (`1_variant_calls/02_SHCS_CHIP_trajectories.Rmd`). In both,
+  the not detected timepoints are at half the LoD of the timepoint.
+- **Spline.** The main specification of `spline_functions.R` (`spec_main` = `r spec_main_name`: penalised regression spline
+  with REML smoothness, at most `k` = `r spec_main$value` basis functions and at most as many as the trajectory has distinct ages), for both
+  cohorts. Other spline settings are compared in `4_sensitivity_analyses/01_spline_sensitivity_and_simulation.Rmd`.
+- **LoD / 2 in place of 0%.** The spline can come down to, or below, 0% between measurements.
+  `VAF` is floored at half the trajectory-specific LoD
+  (`traj_lod`, the mean LoD of the timepoints of the trajectory): below this value a clone cannot be told from one that is
+  not detected. All values below it are floored, not only those <= 0, otherwise a curve value just above 0 would stay below the
+  floored 0. The curve before the floor is kept in `VAF_spline`; speed and acceleration are derivatives of the spline and do not change.
+
+The notebook writes `resources/LoD/SHCS_predicted_trajectories_derivatives.txt` and
+`resources/LoD/Sardinia_predicted_trajectories_derivatives.txt`, and the curves of all SardiNIA trajectories to
+`figures/LoD/Sardinia_predicted_traj_speed_accel.pdf`. Extrapolation is in `02_ages_at_LoD2_and_2pct.Rmd`.
+
+
+# 1. Data
+
+```{r data}
+sard_calls <- read.table(file.path(resources_lod, "sardinia_chip_calls_long_filtered.txt"), sep = "\t", header = TRUE) %>% as_tibble()
+shcs_calls <- read.table(shcs_calls_file, sep = "\t", header = TRUE) %>% as_tibble()
+
+# the two cohorts carry the same columns for the spline functions
+stopifnot(all(sard_calls$Age %% step == 0), all(shcs_calls$Age %% step == 0),
+          n_distinct(select(sard_calls, traj_id, traj_lod_mean)) == n_distinct(sard_calls$traj_id),
+          n_distinct(select(shcs_calls, traj_id, traj_lod_mean)) == n_distinct(shcs_calls$traj_id))
+
+lod_sard <- sard_calls %>% distinct(traj_id, lod = traj_lod_mean)
+lod_shcs <- shcs_calls %>% distinct(traj_id, lod = traj_lod_mean)
+
+bind_rows(shcs_calls %>% transmute(Cohort = "SHCS", ID = as.character(ID), traj_id, source),
+          sard_calls %>% transmute(Cohort = "Sardinia", ID, traj_id, source)) %>%
+  group_by(Cohort) %>%
+  summarise(individuals = n_distinct(ID), trajectories = n_distinct(traj_id), measurements = n(),
+            `imputed (LoD/2)` = sum(source == "imputed"),
+            `trajectories with an imputed timepoint` = n_distinct(traj_id[source == "imputed"])) %>%
+  knitr::kable(caption = "Trajectories")
+```
+
+
+# 2. Curves within the observed ages
+
+Each trajectory is smoothed on its own and predicted every `step` = `r step` years; the speed (VAF / year) is the forward
+difference of the curve over `step` years, the acceleration (VAF / year^2) the difference of consecutive speeds (0 at the
+first age by construction). A trajectory with 3 measurements gets the midpoint of its first two measurements as a 4th point.
+
+```{r predict}
+# the columns of the SHCS curves; the extrapolated curves, the ages and the summary come from the same functions
+sard_res <- run_pipeline(sard_calls, spec_main, lod_sard)
+shcs_res <- run_pipeline(shcs_calls, spec_main, lod_shcs)
+
+floor_lod2 <- function(pred, lod) {
+  pred %>%
+    left_join(lod %>% rename(traj_lod = lod), by = "traj_id") %>%
+    mutate(VAF_spline = VAF, VAF = pmax(VAF_spline, traj_lod / 2))
+}
+
+curve_cols <- c("Age", "ID", "traj_id", "VAF", "VAF_spline", "VAF_speed", "VAF_acceleration", "N_CHIP", "Gene.refGene", "data_point",
+                "Time", "VAF_acceleration_sign", "traj_lod")
+
+predicted_sard <- floor_lod2(sard_res$pred, lod_sard) %>% select(all_of(curve_cols))
+predicted_shcs <- floor_lod2(shcs_res$pred, lod_shcs) %>% select(all_of(curve_cols))
+
+stopifnot(setequal(predicted_sard$traj_id, sard_calls$traj_id), setequal(predicted_shcs$traj_id, shcs_calls$traj_id),
+          !anyNA(predicted_sard$VAF), !anyNA(predicted_shcs$VAF))
+```
+
+Points of the curves that the floor changes. Measured timepoints are the points of the curve at the age of a measurement:
+
+```{r floor-table}
+bind_rows(predicted_shcs %>% select(-ID) %>% mutate(Cohort = "SHCS"), predicted_sard %>% select(-ID) %>% mutate(Cohort = "Sardinia")) %>%
+  group_by(Cohort) %>%
+  summarise(`curve points` = n(), trajectories = n_distinct(traj_id),
+            `points <= 0` = sum(VAF_spline <= 0),
+            `points between 0 and LoD / 2` = sum(VAF_spline > 0 & VAF_spline < traj_lod / 2),
+            `trajectories with a floored point` = n_distinct(traj_id[VAF_spline < traj_lod / 2]),
+            `measured timepoints` = sum(data_point == 1),
+            `measured timepoints floored` = sum(VAF_spline < traj_lod / 2 & data_point == 1)) %>%
+  knitr::kable()
+```
+
+```{r save-curves}
+write.table(predicted_sard, file.path(resources_lod, "Sardinia_predicted_trajectories_derivatives.txt"), sep = "\t", quote = F, row.names = F)
+write.table(predicted_shcs, file.path(resources_lod, "SHCS_predicted_trajectories_derivatives.txt"), sep = "\t", quote = F, row.names = F)
+```
+
+One trajectory per panel: the measurements (filled circle: read counts; open circle: imputed), the curve (VAF, grey), its
+speed (orange) and acceleration (red), on the secondary axis (scaled by the ratio of the maximum VAF to the maximum speed).
+Green dotted line: LoD / 2 of the trajectory.
+
+```{r plot-function}
+source_shapes <- c("read_counts" = 16, "imputed" = 1)
+
+plot_curves <- function(pred, obs, title) {
+  sf <- max(pred$VAF) / max(pred$VAF_speed)
+  if (!is.finite(sf) || sf == 0) sf <- 1
+  stats <- function(x) paste0("max = ", round(max(x), 4), "\n", "mean = ", round(mean(x), 4), "\n",
+                              "median = ", round(median(x), 4), "\n", "min = ", round(min(x), 4), "\n")
+  rng <- range(c(pred$VAF, pred$VAF_speed * sf, pred$VAF_acceleration * sf))
+  ggplot(pred, aes(x = Age, y = VAF)) +
+    geom_line(aes(color = "VAF"), linewidth = 1.3) +
+    geom_line(aes(y = VAF_speed * sf, color = "VAF_speed"), linewidth = 1.3) +
+    geom_line(aes(y = VAF_acceleration * sf, color = "VAF_acceleration"), linewidth = 1.3) +
+    geom_point(data = obs, aes(x = Age, y = AF, shape = source), size = 2) +
+    scale_shape_manual(values = source_shapes) +
+    scale_y_continuous(name = "VAF", sec.axis = sec_axis(~ . / sf, name = "VAF speed/acceleration")) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "darkorange") +
+    geom_hline(yintercept = chip_vaf, linetype = "dashed") +
+    geom_hline(yintercept = pred$traj_lod[1] / 2, linetype = "dotted", color = "forestgreen") +
+    scale_color_manual(values = c("VAF" = "grey34", "VAF_speed" = "orange2", "VAF_acceleration" = "red3")) +
+    annotate(geom = "text", label = stats(pred$VAF_speed), color = "orange2", size = 3,
+             x = min(pred$Age) + diff(range(pred$Age)) * 0.1, y = rng[2] - diff(rng) * 0.15) +
+    annotate(geom = "text", label = stats(pred$VAF_acceleration), color = "red3", size = 3,
+             x = min(pred$Age) + diff(range(pred$Age)) * 0.1, y = rng[1] + diff(rng) * 0.15) +
+    ggtitle(title) +
+    theme_classic() +
+    theme(legend.position = "None", plot.title = element_text(size = 9))
+}
+
+trajectories <- sort(unique(predicted_sard$traj_id))
+plot_list <- lapply(trajectories, function(id) plot_curves(filter(predicted_sard, traj_id == id), filter(sard_calls, traj_id == id), id))
+names(plot_list) <- trajectories
+```
+
+Examples: the trajectories with an imputed timepoint and the largest final VAF:
+
+```{r example-trajectories, fig.width=12, fig.height=7}
+example_ids <- sard_calls %>%
+  group_by(traj_id) %>%
+  filter(any(source == "imputed")) %>%
+  summarise(max_AF = max(AF)) %>%
+  arrange(desc(max_AF)) %>%
+  slice(1:4) %>%
+  pull(traj_id)
+
+grid.arrange(grobs = plot_list[example_ids], ncol = 2)
+```
+
+```{r save-plots}
+pdf(file.path(figures_lod, "Sardinia_predicted_traj_speed_accel.pdf"), width = 10, height = 9)
+for (i in seq(1, length(plot_list), by = 6)) gridExtra::grid.arrange(grobs = plot_list[i:min(i + 5, length(plot_list))], ncol = 2, nrow = 3)
+dev.off()
+```
+
+
+# 3. Explore the curves
+
+By gene, in both cohorts:
+
+```{r by-gene-lines, fig.width=12, fig.height=6}
+lines_by_gene <- function(pred, y, hline, ylab, title) {
+  pred %>%
+    mutate(Gene.refGene = group_genes(Gene.refGene)) %>%
+    ggplot(aes(x = Age, y = .data[[y]], group = traj_id, color = Gene.refGene)) +
+    geom_line() +
+    scale_color_manual(values = gene_colors) +
+    geom_hline(yintercept = hline, linetype = "dashed") +
+    ylab(ylab) +
+    ggtitle(title) +
+    theme_classic() +
+    theme(legend.position = "None") +
+    facet_wrap(~Gene.refGene)
+}
+
+for (v in list(c("VAF", chip_vaf, "VAF"), c("VAF_speed", 0, "VAF speed"), c("VAF_acceleration", 0, "VAF acceleration"))) {
+  grid.arrange(lines_by_gene(predicted_sard, v[1], as.numeric(v[2]), v[3], "SardiNIA"),
+               lines_by_gene(predicted_shcs, v[1], as.numeric(v[2]), v[3], "SHCS"), ncol = 2)
+}
+```
+
+The per-trajectory statistics by gene (one value per trajectory; "All genes" is every trajectory). The cohort comparison is in
+`6_figures_and_tables/Figure4_FiguresS11_S18.Rmd`.
+
+```{r summary}
+summary_table <- function(res, lod) traj_summary(floor_lod2(res$pred, lod), res$ages)
+
+sum_sard <- summary_table(sard_res, lod_sard)
+sum_shcs <- summary_table(shcs_res, lod_shcs)
+
+write.table(sum_sard, file.path(resources_lod, "Sardinia_predicted_trajectories_summary.txt"), sep = "\t", quote = F, row.names = F)
+write.table(sum_shcs, file.path(resources_lod, "SHCS_predicted_trajectories_summary.txt"), sep = "\t", quote = F, row.names = F)
+
+bind_rows(sum_shcs %>% count(group) %>% mutate(Cohort = "SHCS"), sum_sard %>% count(group) %>% mutate(Cohort = "Sardinia")) %>%
+  group_by(Cohort) %>%
+  mutate(cell = sprintf("%d (%.0f%%)", n, 100 * n / sum(n))) %>%
+  select(-n) %>%
+  pivot_wider(names_from = Cohort, values_from = cell, values_fill = "0") %>%
+  knitr::kable(caption = "Dynamics groups (definition: section 4 of the SHCS splines notebook)")
+```
+
+```{r box-by-gene, fig.width=13, fig.height=11}
+box_by_gene <- function(sum_df, stat, ylab, hline = 0) {
+  d <- bind_rows(sum_df %>% mutate(Gene.refGene = as.character(Gene.refGene)),
+                 sum_df %>% mutate(Gene.refGene = "All genes")) %>%
+    mutate(Gene.refGene = factor(Gene.refGene, levels = c("All genes", gene_levels)))
+  p <- ggplot(d, aes(y = .data[[stat]], x = Gene.refGene)) +
+    geom_boxplot(aes(fill = Gene.refGene)) +
+    scale_fill_manual(values = gene_colors) +
+    theme_classic() + xlab("") + ylab(ylab) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "None")
+  if (!is.null(hline)) p <- p + geom_hline(yintercept = hline, linetype = "dashed")
+  p
+}
+
+stats_gene <- c(mean_VAF_speed = "VAF speed (mean)", min_VAF_speed = "VAF speed (min)", max_VAF_speed = "VAF speed (max)",
+                sd_VAF_speed = "VAF speed (sd)", mean_VAF_acceleration = "VAF acceleration (mean)",
+                min_VAF_acceleration = "VAF acceleration (min)", max_VAF_acceleration = "VAF acceleration (max)",
+                sd_VAF_acceleration = "VAF acceleration (sd)", max_VAF = "VAF (max)")
+
+do.call(grid.arrange, c(lapply(names(stats_gene), function(s) {
+  box_by_gene(sum_sard, s, stats_gene[[s]], if (s == "max_VAF") chip_vaf else 0)
+}), ncol = 3, top = "SardiNIA"))
+```
+
+# Session
+
+```{r session}
+sessionInfo()
+```
