@@ -532,10 +532,9 @@ p_c <- ggplot(err_long, aes(x = s, y = `median relative error of mean speed`, co
   theme_bw(base_size = 12)
 p_d <- ggplot(err_long, aes(x = s, y = `median absolute error of mean acceleration`, colour = sampling)) +
   geom_line() + geom_point(size = 1.2) +
-  geom_line(data = err_long %>% filter(every == 1, spline == "REML"), aes(y = `median |reference mean acceleration|`, group = 1), colour = "grey50", linetype = "dotted", linewidth = 0.8) +
   scale_x_log10(breaks = c(0.01, 0.025, 0.05, 0.1, 0.2, 0.5), labels = c("0.01", "0.025", "0.05", "0.1", "0.2", "0.5")) +
   scale_colour_manual(values = c("every year" = "black", "every 2 years" = "#f4a09a", "every 3 years" = "#e8655f", "every 5 years" = reml_col), name = "Sampling") +
-  labs(x = "Fitness s (per year, log scale)", y = "Median absolute error of the mean acceleration\n(VAF / year^2; dotted: median |reference acceleration|)") +
+  labs(x = "Fitness s (per year, log scale)", y = "Median absolute error of the mean acceleration\n(VAF / year^2)") +
   theme_bw(base_size = 12)
 save_panel(p_a, "supp", "FigS5_simulation_a_curves", 13, 5.5)
 save_panel(p_b, "supp", "FigS5_simulation_b_mean_speed", 5, 4.5)

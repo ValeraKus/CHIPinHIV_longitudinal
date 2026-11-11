@@ -18,7 +18,7 @@ Figure 2 on the REML curves of the 71 trajectories (`resources/LoD/`): the per-t
 statistics by gene (maximal VAF, mean speed, mean acceleration, age at LoD/2 and age at 2% VAF), the gene-level tests and
 the correlation with the fitness effects of Fabre et al. 2022, the correlation heatmap of the statistics, the scheme of
 the two modes of growth, and the final consensus DTW clusters (`03_consensus_clusters.Rmd`). Also the
-supplementary figures of the statistics by cluster (Figure S7) and of the individuals with several trajectories by cluster
+supplementary figures of the statistics by cluster (Figure S7, pairwise Wilcoxon rank-sum tests) and of the individuals with several trajectories by cluster
 (Figure S8). The sign
 of the mean speed and of the mean acceleration of each trajectory is checked against the 95% interval from the posterior
 of the spline coefficients.
@@ -117,11 +117,22 @@ knitr::kable(fc$genes, digits = 4, caption = "Gene means against the Fabre et al
 
 # 3. Figure 2f-g: correlations of the statistics and the two modes of growth
 
-```{r fig2f, fig.width=8, fig.height=7}
-col_order <- c("N_CHIP_more1", "mean_VAF", "sd_VAF", "min_VAF", "max_VAF", "mean_VAF_speed", "max_VAF_speed", "mean_VAF_acceleration",
+The SD of the VAF acceleration enters the heatmap only if it is as stable across the nine alternative spline settings
+as the statistics of the main analysis (Spearman rho with the REML analysis >= 0.87 under every setting; Figure S4b,
+`spline_settings_comparison.txt` of the sensitivity notebook). The minimum and SD of the speed and the maximal
+acceleration are shown although they depend on the smoothing (Figure S4b).
+
+```{r fig2f, fig.width=9, fig.height=8}
+rho_sd_acc <- read_tsv_(file.path(rev$results, "spline_settings_comparison.txt")) %>%
+  filter(!grepl("main", setting)) %>% pull(`rho sd_VAF_acceleration`)
+sd_acc_robust <- length(rho_sd_acc) > 0 && all(!is.na(rho_sd_acc)) && min(rho_sd_acc) >= 0.87
+cat(sprintf("SD of the VAF acceleration: Spearman rho with REML under the nine settings %.2f-%.2f; in the heatmap: %s\n",
+            min(rho_sd_acc), max(rho_sd_acc), sd_acc_robust))
+col_order <- c("N_CHIP_more1", "mean_VAF", "sd_VAF", "min_VAF", "max_VAF", "mean_VAF_speed", "min_VAF_speed", "max_VAF_speed", "sd_VAF_speed",
+               "mean_VAF_acceleration", "max_VAF_acceleration", if (sd_acc_robust) "sd_VAF_acceleration",
                "mean_Age", "min_Age", "max_Age", "Time", "Age_LoD2", "Age_0.02")
 hm <- corr_heatmap(sum_ %>% select(all_of(col_order)), col_order, stat_labels, size = 16)
-save_panel(hm, 2, "Fig2f_statistics_heatmap", 8, 7)
+save_panel(hm, 2, "Fig2f_statistics_heatmap", 9, 8)
 hm
 rc <- Hmisc::rcorr(as.matrix(sum_[, col_order]), type = "spearman")
 cor_long <- as.data.frame(rc$r) %>% rownames_to_column("stat1") %>% pivot_longer(-stat1, names_to = "stat2", values_to = "rho") %>%
@@ -157,14 +168,17 @@ sum_c <- sum_c %>% left_join(first_tp, by = "traj_id") %>%
   mutate(crossed_2pct_during_fup = !is.na(Age_0.02) & Age_0.02 > first_age + 0.25, first_not_detected = first_source == "imputed",
          cluster_label = cluster_factor(cluster, cl))
 cl_stats <- c(mean_VAF = "VAF (mean)", max_VAF = "VAF (max)", mean_VAF_speed = "VAF speed (mean)", max_VAF_speed = "VAF speed (max)",
-              mean_VAF_acceleration = "VAF acceleration (mean)", mean_Age = "Age (mean)", Time = "Follow-up time, years",
-              Age_LoD2 = "Age at LoD/2", Age_0.02 = "Age at 2% VAF")
-test_k <- function(x, g) kruskal.test(x ~ g)$p.value   # Kruskal-Wallis, as printed in Figure S7 (also when one cluster has no value)
+              sd_VAF_speed = "VAF speed (sd)", mean_VAF_acceleration = "VAF acceleration (mean)", max_VAF_acceleration = "VAF acceleration (max)",
+              mean_Age = "Age (mean)", Time = "Follow-up time, years", Age_LoD2 = "Age at LoD/2", Age_0.02 = "Age at 2% VAF")
+# pairwise Wilcoxon rank-sum tests, as printed in Figure 2i and Figure S7; the Kruskal-Wallis p for reference
 cl_tab <- map_dfr(names(cl_stats), function(s) {
   d <- sum_c %>% filter(!is.na(.data[[s]]))
   med <- d %>% group_by(cluster_label) %>% summarise(n = n(), median = median(.data[[s]]), .groups = "drop")
-  tibble(statistic = cl_stats[[s]], !!!setNames(as.list(sprintf("%s (n = %d)", signif(med$median, 3), med$n)), as.character(med$cluster_label)), p = test_k(d[[s]], d$cluster_label))
-})
+  pw <- cluster_pairwise_wilcox(d[[s]], d$cluster_label)
+  tibble(statistic = cl_stats[[s]], !!!setNames(as.list(sprintf("%s (n = %d)", signif(med$median, 3), med$n)), as.character(med$cluster_label)),
+         !!!setNames(as.list(pw$p), paste0("p Wilcoxon, ", pw$group1, " vs ", pw$group2)),
+         p = kruskal.test(d[[s]] ~ droplevels(d$cluster_label))$p.value)
+}) %>% rename(`p Kruskal-Wallis` = p)
 t2 <- table(sum_c$crossed_2pct_during_fup, sum_c$cluster_label)
 tg <- table(group_genes(sum_c$Gene.refGene), sum_c$cluster_label)
 share_row <- function(name, v) {
@@ -172,20 +186,21 @@ share_row <- function(name, v) {
   tibble(statistic = name, !!!setNames(as.list(sh$x), as.character(sh$cluster_label)), p = fisher.test(table(sum_c[[v]], sum_c$cluster_label))$p.value)
 }
 set.seed(2026)   # the Fisher test of the genes uses a simulated p value
-cl_tab <- bind_rows(cl_tab, share_row("crossed 2% VAF during follow-up, n (%)", "crossed_2pct_during_fup"), share_row("not detected at the first timepoint, n (%)", "first_not_detected"),
+cl_tab <- bind_rows(cl_tab %>% rename(p = `p Kruskal-Wallis`), share_row("crossed 2% VAF during follow-up, n (%)", "crossed_2pct_during_fup"), share_row("not detected at the first timepoint, n (%)", "first_not_detected"),
                     tibble(statistic = "genes (Fisher)", p = fisher.test(tg, simulate.p.value = TRUE, B = 10000)$p.value))
-knitr::kable(cl_tab %>% mutate(p = signif(p, 2)))
+cl_tab <- cl_tab %>% rename(`p Kruskal-Wallis / Fisher` = p)
+knitr::kable(cl_tab %>% mutate(across(starts_with("p "), ~ signif(.x, 2))))
 write_res(cl_tab, "fig2_cluster_statistics.txt")
 knitr::kable(tg, caption = "Genes by cluster")
 ```
 
 # 5. Figure S7: statistics by cluster
 
-```{r figS-clusters, fig.width=13, fig.height=7}
-hl <- c(mean_VAF = chip_vaf, max_VAF = chip_vaf, mean_VAF_speed = 0, max_VAF_speed = 0, mean_VAF_acceleration = 0)
-p_s2 <- wrap_plots(imap(cl_stats, ~ cluster_box(sum_c, .y, .x, if (.y %in% names(hl)) hl[[.y]] else NULL, size = 13, clusters = cl) +
-                          theme(axis.text.x = element_text(size = 10))), ncol = 5) + plot_annotation(tag_levels = "a") & tag_theme
-save_supp(p_s2, "FigS7_clusters_statistics", 13, 7)
+```{r figS-clusters, fig.width=13, fig.height=11}
+hl <- c(mean_VAF = chip_vaf, max_VAF = chip_vaf, mean_VAF_speed = 0, max_VAF_speed = 0, mean_VAF_acceleration = 0, max_VAF_acceleration = 0)
+p_s2 <- wrap_plots(imap(cl_stats, ~ cluster_box(sum_c, .y, .x, if (.y %in% names(hl)) hl[[.y]] else NULL, size = 13, clusters = cl, p_size = 3.3) +
+                          theme(axis.text.x = element_text(size = 10))), ncol = 4) + plot_annotation(tag_levels = "a") & tag_theme
+save_supp(p_s2, "FigS7_clusters_statistics", 13, 11)
 p_s2
 ```
 
@@ -213,14 +228,15 @@ p_s3
 
 # 7. Figure 2 assembled
 
-```{r fig2, fig.width=16, fig.height=15}
-# three rows; the five gene panels share one row so that their plotting areas are identical
+```{r fig2, fig.width=16, fig.height=16}
+# three rows; the five gene panels share one row so that their plotting areas are identical. The y-axis titles of a and h
+# are freed (free(type = "label")) so that they stay next to their axis instead of being aligned with the long labels of f
 hm2 <- hm + theme(text = element_text(size = 13), axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 10))
-row1 <- (p2a | p2b | p2c | p2d | p2e) + plot_layout(widths = rep(1, 5))
+row1 <- (free(p2a, type = "label", side = "l") | p2b | p2c | p2d | p2e) + plot_layout(widths = rep(1, 5))
 row2 <- (hm2 | p_2g) + plot_layout(widths = c(1.15, 1))
-row3 <- (p2h | p2i | p2j) + plot_layout(widths = c(3, 1.05, 1))
-p_2 <- (row1 / row2 / row3) + plot_layout(heights = c(1, 1.7, 1.1)) + plot_annotation(tag_levels = "a") & tag_theme
-save_main(p_2, 2, "Figure2", 16, 15, svg = TRUE)
+row3 <- (free(p2h, type = "label", side = "l") | p2i | p2j) + plot_layout(widths = c(3, 1.05, 1))
+p_2 <- (row1 / row2 / row3) + plot_layout(heights = c(1, 1.85, 1.2)) + plot_annotation(tag_levels = "a") & tag_theme
+save_main(p_2, 2, "Figure2", 16, 16, svg = TRUE)
 p_2
 ```
 

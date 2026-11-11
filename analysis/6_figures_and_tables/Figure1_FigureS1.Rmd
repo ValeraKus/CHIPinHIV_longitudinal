@@ -61,7 +61,7 @@ knitr::kable(genes %>% count(ExonicFunc.refGene) %>% arrange(-n) %>% mutate(shar
 # 2. Figure 1b: one trajectory with the REML spline, its uncertainty and the LoD
 
 The panel shows a hypothetical trajectory of five measurements, fitted with the REML spline of the main analysis, with
-the LoD and the extrapolation back to LoD/2. The band around the curve is the 95% interval of the REML fit; speed and
+the LoD of the trajectory (the mean LoD of its timepoints, as in the main analysis) and the extrapolation back to LoD/2. The band around the curve is the 95% interval of the REML fit; speed and
 acceleration (orange, red) are the finite differences of the curve over half a year, with 95% intervals from
 `r n_draws` draws of the spline coefficients.
 
@@ -69,7 +69,8 @@ acceleration (orange, red) are the finite differences of the curve over half a y
 # A hypothetical trajectory, fitted with the REML spline of the main analysis
 obs <- tibble(Age = c(55, 60, 65, 70, 75), AF = c(0.06, 0.10, 0.08, 0.12, 0.20), lod_vaf = 0.003)
 fit <- fit_traj(obs$Age, obs$AF, spec_main)
-lod2 <- obs$lod_vaf[1] / 2
+traj_lod <- mean(obs$lod_vaf)   # the LoD of the trajectory: the mean LoD of its timepoints
+lod2 <- traj_lod / 2
 grid_age <- seq(min(obs$Age), max(obs$Age), by = 0.1)
 fs <- fitted_samples(fit$model, n = n_draws, data = data.frame(Age = c(grid_age, grid_age + step)), seed = 1) %>% arrange(.draw, .row)
 n <- length(grid_age)
@@ -103,8 +104,7 @@ p_1b <- ggplot() +
   geom_line(data = extrap, aes(x = Age, y = VAF), colour = "grey40", linewidth = 1.2, linetype = "dashed") +
   geom_line(data = curve_main, aes(x = Age, y = VAF), colour = "grey35", linewidth = 1.6) +
   geom_line(data = filter(bands, curve != "VAF"), aes(x = Age, y = mean * sec, colour = curve), linewidth = 1.3) +
-  geom_line(data = obs, aes(x = Age, y = lod_vaf, linetype = "LoD of the timepoint"), colour = "black", linewidth = 0.5) +
-  geom_hline(yintercept = 0, colour = "#E69F00", linetype = "dotted", linewidth = 0.5) +
+  geom_hline(data = tibble(y = traj_lod), aes(yintercept = y, linetype = "LoD of the trajectory"), colour = "black", linewidth = 0.5) +
   geom_hline(yintercept = chip_vaf, linetype = "dashed", linewidth = 0.4) +
   geom_point(data = obs, aes(x = Age, y = AF), size = 3, colour = "black") +
   annotate("point", x = age2$Age_0.02, y = chip_vaf, shape = 23, size = 3.8, fill = "white", colour = "grey20") +
@@ -116,7 +116,7 @@ p_1b <- ggplot() +
   scale_y_continuous(name = "VAF", sec.axis = sec_axis(~ . / sec, name = "VAF speed | acceleration"), expand = expansion(mult = c(0.03, 0.08))) +
   scale_colour_manual(values = deriv_colors, name = NULL, guide = guide_legend(order = 2)) +
   scale_fill_manual(values = deriv_colors, guide = "none") +
-  scale_linetype_manual(values = c("LoD of the timepoint" = "dotted"), name = NULL, guide = guide_legend(order = 1)) +
+  scale_linetype_manual(values = c("LoD of the trajectory" = "dotted"), name = NULL, guide = guide_legend(order = 1)) +
   labs(x = "Age") +
   theme_classic(base_size = 15) +
   theme(axis.title.y.right = element_text(colour = "#E69F00"), axis.text.y.right = element_text(colour = "#E69F00"),

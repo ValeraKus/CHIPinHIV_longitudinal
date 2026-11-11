@@ -2097,7 +2097,7 @@ cohort_colors <- hiv_colors[cohort_levels]
 
 shcs_meas <- read.delim("results/SHCS_CHIP_variants_depth_LoD.txt") %>%
   transmute(cohort = "SHCS", id = SHCS_ID, traj_id = Trajectory, n = Depth, k = Alt_reads, lod_table = LoD,
-            group = recode(Source, "Mutect2" = "Mutect2 call", "bam-readcount" = "bam-readcount",
+            group = recode(Source, "Mutect2" = "Mutect2 call", "bam-readcount" = "variant reads in the pile-up",
                            "imputed" = "not detected (k = 0)"))
 
 sard_set <- read.table("resources/LoD/sardinia_chip_calls_long_filtered.txt", sep = "\t", header = TRUE) %>%
@@ -2137,7 +2137,7 @@ add_lod_paper <- function(df) {
 
 cohort_meas   <- add_lod_paper(bind_rows(shcs_meas, sard_meas)) %>%
   mutate(cohort = factor(cohort, levels = cohort_levels),
-         group  = factor(group, levels = c("Mutect2 call", "bam-readcount", "variant reads (k >= 1)", "not detected (k = 0)")))
+         group  = factor(group, levels = c("Mutect2 call", "variant reads in the pile-up", "variant reads (k >= 1)", "not detected (k = 0)")))
 detection_obs <- add_lod_paper(detection_obs)
 
 # the LoD in the SHCS table is the same calculation (rounded there)
@@ -2407,7 +2407,7 @@ background_plot <- background_pairs %>%
   mutate(k_jitter = k + runif(n(), -0.15, 0.15))
 
 fig_reads_shcs <- plot_reads_vs_kstar(shcs_plot_meas,
-                                      group_levels = c("Mutect2 call", "bam-readcount", "not detected (k = 0)"),
+                                      group_levels = c("Mutect2 call", "variant reads in the pile-up", "not detected (k = 0)"),
                                       background = background_plot,
                                       background_label = "background (no variant expected)")
 fig_reads_shcs
@@ -2565,9 +2565,9 @@ det_r  <- detection_obs %>% filter(set == "CHIP clones") %>% mutate(r = vaf / lo
   depth of `r median(sard_m$n)` (IQR `r round(quantile(sard_m$n, 0.25))`-`r round(quantile(sard_m$n, 0.75))`) and a median LoD of
   `r percent(median(sard_m$lod_vaf), accuracy = 0.01)` (range `r percent(min(sard_m$lod_vaf), accuracy = 0.01)`-`r percent(max(sard_m$lod_vaf), accuracy = 0.01)`).
 - **Measurements against k\*.** In SHCS `r sum(shcs_m$group == "Mutect2 call" & shcs_m$vaf >= shcs_m$lod_vaf)` of the
-  `r sum(shcs_m$group == "Mutect2 call")` Mutect2 measurements are above the LoD; of the `r sum(shcs_m$group == "bam-readcount")` measurements from bam-readcount,
-  `r sum(shcs_m$group == "bam-readcount" & shcs_m$called)` reach `k*` and
-  `r sum(shcs_m$group == "bam-readcount" & shcs_m$vaf >= shcs_m$lod_vaf)` are above the LoD. In SardiNIA
+  `r sum(shcs_m$group == "Mutect2 call")` Mutect2 measurements are above the LoD; of the `r sum(shcs_m$group == "variant reads in the pile-up")` measurements from bam-readcount,
+  `r sum(shcs_m$group == "variant reads in the pile-up" & shcs_m$called)` reach `k*` and
+  `r sum(shcs_m$group == "variant reads in the pile-up" & shcs_m$vaf >= shcs_m$lod_vaf)` are above the LoD. In SardiNIA
   `r percent(mean(sard_m$vaf >= sard_m$lod_vaf), accuracy = 0.1)` of the measurements are above the LoD and
   `r sum(sard_m$k == 0)` have no variant read.
 - **Error background.** At `r format(nrow(background_pairs), big.mark = ",")` (site, base) pairs at CHIP positions

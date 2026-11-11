@@ -294,23 +294,45 @@ cluster_genes_plot <- function(clusters, gene_tbl, size = 15) {
     theme_bw(base_size = size) + theme(legend.position = "none")
 }
 
-# Figure 2i and Figure S7: one statistic by cluster with the p value of the test;
-# the test is Wilcoxon for two clusters and Kruskal-Wallis for more; `clusters` gives the labels
-cluster_box <- function(sum_df, stat, ylab, hline = 0, size = 15, clusters = NULL) {
+# pairwise two-sided Wilcoxon rank-sum tests between the clusters that have values (not adjusted for multiple testing)
+cluster_pairwise_wilcox <- function(x, g) {
+  g <- droplevels(as.factor(g))
+  lev <- levels(g)
+  if (length(lev) < 2) return(tibble(group1 = character(), group2 = character(), i = integer(), j = integer(), p = numeric()))
+  map_dfr(combn(seq_along(lev), 2, simplify = FALSE), function(ij)
+    tibble(group1 = lev[ij[1]], group2 = lev[ij[2]], i = ij[1], j = ij[2],
+           n1 = sum(g == lev[ij[1]]), n2 = sum(g == lev[ij[2]]),
+           p = wilcox.test(x[g == lev[ij[1]]], x[g == lev[ij[2]]], exact = FALSE)$p.value))
+}
+
+# Figure 2i and Figure S7: one statistic by cluster with the p values of pairwise Wilcoxon rank-sum tests (brackets);
+# `clusters` gives the labels; clusters without a value of the statistic are left out
+cluster_box <- function(sum_df, stat, ylab, hline = 0, size = 15, clusters = NULL, p_size = 3.6) {
   d <- sum_df %>% filter(!is.na(.data[[stat]]))
   d$cluster <- if (is.null(clusters)) factor(cluster_labels[as.character(d$cluster)], levels = cluster_labels) else cluster_factor(d$cluster, clusters)
-  k <- nlevels(d$cluster)
-  p <- if (k == 2) wilcox.test(d[[stat]] ~ d$cluster, exact = FALSE)$p.value else kruskal.test(d[[stat]] ~ d$cluster)$p.value
-  fills <- setNames(cluster_fill_k[seq_len(k)], levels(d$cluster))
+  fills <- setNames(cluster_fill_k[seq_len(nlevels(d$cluster))], levels(d$cluster))
+  d$cluster <- droplevels(d$cluster)
+  fills <- fills[levels(d$cluster)]
+  pw <- cluster_pairwise_wilcox(d[[stat]], d$cluster)
   n_lev <- table(d$cluster); lab_n <- paste0(levels(d$cluster), "\nn = ", n_lev[levels(d$cluster)])
   names(fills) <- lab_n; d$cluster <- factor(lab_n[as.integer(d$cluster)], levels = lab_n)
+  # brackets: neighbouring clusters on the first level, the outer pair above them
+  y_top <- max(c(d[[stat]], hline), na.rm = TRUE); y_rng <- diff(range(c(d[[stat]], hline), na.rm = TRUE))
+  pw <- pw %>% mutate(level = ifelse(j - i == 1, 1, 2), inset = ifelse(j - i == 1 & nrow(pw) > 1, 0.06, 0),
+                      y = y_top + y_rng * (0.08 + 0.15 * (level - 1)), x1 = i + inset, x2 = j - inset)
+  tick <- 0.025 * y_rng
   pl <- ggplot(d, aes(x = cluster, y = .data[[stat]])) +
     geom_boxplot(aes(fill = cluster), outlier.size = 0.8) +
     scale_fill_manual(values = fills) +
-    annotate("text", x = (k + 1) / 2, y = Inf, vjust = 1.5, label = p_label(p), size = 4.2) +
     labs(x = NULL, y = ylab) +
     theme_classic(base_size = size) + theme(legend.position = "none", axis.text.x = element_text(size = size - 3))
   if (!is.null(hline)) pl <- pl + geom_hline(yintercept = hline, linetype = "dashed")
+  if (nrow(pw)) pl <- pl +
+    geom_segment(data = pw, aes(x = x1, xend = x2, y = y, yend = y), inherit.aes = FALSE, linewidth = 0.4) +
+    geom_segment(data = pw, aes(x = x1, xend = x1, y = y, yend = y - tick), inherit.aes = FALSE, linewidth = 0.4) +
+    geom_segment(data = pw, aes(x = x2, xend = x2, y = y, yend = y - tick), inherit.aes = FALSE, linewidth = 0.4) +
+    geom_text(data = pw, aes(x = (x1 + x2) / 2, y = y + 0.012 * y_rng, label = p_label(p)), inherit.aes = FALSE, vjust = 0, size = p_size) +
+    geom_blank(data = tibble(y = max(pw$y) + 0.1 * y_rng), aes(y = y), inherit.aes = FALSE)
   pl
 }
 

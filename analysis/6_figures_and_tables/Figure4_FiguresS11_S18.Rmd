@@ -112,16 +112,18 @@ p_5bc
 
 # 3. Summary statistics of the trajectories (unmatched set, 5 genes)
 
-```{r fig4stats, fig.width=15, fig.height=6}
+The figure shows the maximal VAF, the mean and maximal speed and the two ages; the SD of the speed and the statistics of
+the acceleration are in Figure S15 (all statistics in every set: Figures S15-S18, Table S12).
+
+```{r fig4stats, fig.width=15, fig.height=3.5}
 sums <- map(sets, ~ set_summary(.x, ages))
-panels_st <- c(max_VAF = "VAF (max)", mean_VAF_speed = "VAF speed (mean)", max_VAF_speed = "VAF speed (max)", sd_VAF_speed = "VAF speed (sd)",
-               mean_VAF_acceleration = "VAF acceleration (mean)", max_VAF_acceleration = "VAF acceleration (max)", sd_VAF_acceleration = "VAF acceleration (sd)",
+panels_st <- c(max_VAF = "VAF (max)", mean_VAF_speed = "VAF speed (mean)", max_VAF_speed = "VAF speed (max)",
                Age_LoD2 = "Age at LoD/2", Age_0.02 = "Age at 2% VAF")
 hlines <- c(max_VAF = chip_vaf, mean_VAF_speed = 0, max_VAF_speed = 0, mean_VAF_acceleration = 0, max_VAF_acceleration = 0)
 stat_panels <- imap(panels_st, ~ cohort_box(sums$unmatched, .y, .x, if (.y %in% names(hlines)) hlines[[.y]] else NULL))
 first_letter <- 2 + k_cl + 1
 for (i in seq_along(stat_panels)) save_panel(stat_panels[[i]], 4, paste0("Fig4", letters[first_letter + i - 1], "_", names(panels_st)[i]), 3, 3.3)
-p_5st <- wrap_plots(stat_panels, nrow = 2)
+p_5st <- wrap_plots(stat_panels, nrow = 1)
 p_5st
 ```
 
@@ -147,15 +149,15 @@ tests %>% filter(set == "Unmatched") %>% mutate(across(where(is.numeric), ~ sign
 
 # 4. Figure 4 assembled
 
-```{r fig4, fig.width=15, fig.height=15}
+```{r fig4, fig.width=15, fig.height=13}
 n_top <- 1 + k_cl   # a + b + the clusters are 2 + k_cl panels: a and b on the first row, the clusters on the second
 row1 <- c(wrap_elements(full = p_5a), p_5b + theme(legend.position = "none"))
 row2 <- map(p_cl, ~ .x + theme(legend.position = "none"))
 p_top <- wrap_plots(row1, nrow = 1, widths = c(1, 1.2))
 p_mid <- wrap_plots(row2, nrow = 1)
-p_bot <- wrap_plots(stat_panels, nrow = 2)
-p_5 <- (p_top / p_mid / p_bot) + plot_layout(heights = c(1, 1, 1.5)) + plot_annotation(tag_levels = "a") & tag_theme
-save_main(p_5, 4, "Figure4", 15, 16, svg = TRUE)
+p_bot <- wrap_plots(stat_panels, nrow = 1)
+p_5 <- (p_top / p_mid / p_bot) + plot_layout(heights = c(1, 1, 0.8)) + plot_annotation(tag_levels = "a") & tag_theme
+save_main(p_5, 4, "Figure4", 15, 13, svg = TRUE)
 p_5
 ```
 

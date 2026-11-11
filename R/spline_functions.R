@@ -215,7 +215,7 @@ traj_stats <- function(age, af, spec, lod = NA_real_) {
   c(mean_VAF_speed = mean(c1$VAF_speed), max_VAF_speed = max(c1$VAF_speed), min_VAF_speed = min(c1$VAF_speed),
     sd_VAF_speed = sd(c1$VAF_speed), mean_VAF_acceleration = mean(c1$VAF_acceleration),
     max_VAF_acceleration = max(c1$VAF_acceleration), min_VAF_acceleration = min(c1$VAF_acceleration),
-    max_VAF = max(c1$VAF), threshold_ages_one(a2, pmax(f$predict(a2), 0), lod), df = f$df)
+    sd_VAF_acceleration = sd(c1$VAF_acceleration), max_VAF = max(c1$VAF), threshold_ages_one(a2, pmax(f$predict(a2), 0), lod), df = f$df)
 }
 
 
@@ -419,7 +419,7 @@ cohort_tests <- function(sum_shcs, sum_sard, cl_shcs, cl_sard) {
 
 # everything checked for one setting, SHCS (and SardiNIA when given): res = list(sum, clusters, sard_sum, sard_clusters)
 key_stats <- c("mean_VAF_speed", "max_VAF_speed", "min_VAF_speed", "sd_VAF_speed",
-               "mean_VAF_acceleration", "max_VAF_acceleration", "min_VAF_acceleration", "max_VAF",
+               "mean_VAF_acceleration", "max_VAF_acceleration", "min_VAF_acceleration", "sd_VAF_acceleration", "max_VAF",
                "Age_zero", "Age_LoD2", "Age_LoD", "Age_0.02")
 
 setting_results <- function(res, fabre) {
