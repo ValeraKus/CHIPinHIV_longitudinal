@@ -2,7 +2,7 @@
 
 Analysis code for:
 
-> Timonina V, Calmy A, Cavassini M, Capoferri G, Günthard HF, Walti LN, Schmid P, Tarr PE, Bick AG, Fellay J and the
+> Timonina V, van der Graaf A, Calmy A, Cavassini M, Capoferri G, Günthard HF, Walti LN, Schmid P, Tarr PE, Bick AG, Fellay J and the
 > Swiss HIV Cohort Study. **Longitudinal modelling of clonal hematopoiesis reveals altered early clonal dynamics in
 > people with HIV.** *medRxiv* 2026.04.08.26350407 (2026). <https://doi.org/10.64898/2026.04.08.26350407>
 
@@ -11,7 +11,7 @@ If you use this code, please cite the paper ([medRxiv](https://www.medrxiv.org/c
 ```bibtex
 @article{Timonina2026CHIPtrajectories,
   title   = {Longitudinal modelling of clonal hematopoiesis reveals altered early clonal dynamics in people with HIV},
-  author  = {Timonina, Valeriia and Calmy, Alexandra and Cavassini, Matthias and Capoferri, Gioele and
+  author  = {Timonina, Valeriia and van der Graaf, Adriaan and Calmy, Alexandra and Cavassini, Matthias and Capoferri, Gioele and
              G{\"u}nthard, Huldrych F. and Walti, Laura N. and Schmid, Patrick and Tarr, Philip E. and
              Bick, Alexander G. and Fellay, Jacques and {Swiss HIV Cohort Study}},
   journal = {medRxiv},
